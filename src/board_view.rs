@@ -96,7 +96,7 @@ fn app_icon() -> Icon {
 
 pub(crate) fn window_conf() -> Conf {
     Conf {
-        window_title: "Wuziqi - Gomoku".to_owned(),
+        window_title: format!("Wuziqi - Gomoku v{}", env!("CARGO_PKG_VERSION")),
         window_width: WIN_W as i32,
         window_height: WIN_H as i32,
         window_resizable: false,
