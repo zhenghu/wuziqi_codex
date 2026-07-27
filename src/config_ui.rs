@@ -1,6 +1,6 @@
 //! OpenRouter 配置弹窗。配置保存为被 Git 忽略的 JSON 文件。
 
-use crate::llm_ai::{config_path, LlmConfig, DEFAULT_API_URL, DEFAULT_MODEL};
+use crate::llm_ai::{DEFAULT_API_URL, DEFAULT_MODEL, LlmConfig, config_path};
 use macroquad::miniquad::window::clipboard_get;
 use macroquad::prelude::*;
 #[cfg(target_os = "macos")]

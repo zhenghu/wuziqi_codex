@@ -1,6 +1,6 @@
 # wuziqi_codex — 五子棋 (Gomoku)
 
-用 Rust + [macroquad](https://github.com/not-fl3/macroquad) 编写的五子棋小游戏,支持人机对战和双人对战。附带一个逻辑完全一致的网页移植版,无需安装任何东西即可游玩。
+用 Rust 2024 Edition + [macroquad](https://github.com/not-fl3/macroquad) 编写的五子棋小游戏,支持人机对战和双人对战。附带一个逻辑完全一致的网页移植版,无需安装任何东西即可游玩。
 
 当前版本：`0.2.0-beta.1`
 

@@ -1,4 +1,4 @@
-use super::super::game::{Cell, Game, Mode, BOARD};
+use super::super::game::{BOARD, Cell, Game, Mode};
 
 pub(super) type Board = [[Cell; BOARD]; BOARD];
 

@@ -1,6 +1,6 @@
 //! 五子棋的落点评分、战术识别与限宽搜索。
 
-use crate::game::{in_board, opponent, winning_line, Cell, BOARD, CENTER, DIRECTIONS};
+use crate::game::{BOARD, CENTER, Cell, DIRECTIONS, in_board, opponent, winning_line};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -197,8 +197,8 @@ fn ranked_moves(
         .collect();
     scored.sort_by(|a, b| {
         b.1.cmp(&a.1)
-            .then_with(|| a.0 .1.cmp(&b.0 .1))
-            .then_with(|| a.0 .0.cmp(&b.0 .0))
+            .then_with(|| a.0.1.cmp(&b.0.1))
+            .then_with(|| a.0.0.cmp(&b.0.0))
     });
 
     let mut selected = Vec::new();
@@ -575,15 +575,17 @@ mod search_tests {
         let board = [[Cell::Empty; BOARD]; BOARD];
         let mut context = SearchContext::new(0, SEARCH_SAFETY_TIMEOUT);
 
-        assert!(minimax(
-            &board,
-            Cell::Black,
-            Cell::Black,
-            4,
-            -MATE_SCORE * 2,
-            MATE_SCORE * 2,
-            &mut context,
-        )
-        .is_none());
+        assert!(
+            minimax(
+                &board,
+                Cell::Black,
+                Cell::Black,
+                4,
+                -MATE_SCORE * 2,
+                MATE_SCORE * 2,
+                &mut context,
+            )
+            .is_none()
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! 通过 OpenRouter Chat Completions API 从战术引擎筛选出的合法点中选择落子。
 
-use crate::game::{Cell, BOARD};
+use crate::game::{BOARD, Cell};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -588,11 +588,14 @@ pub(crate) fn build_client() -> Result<reqwest::Client, String> {
 
 async fn read_limited_body(mut response: reqwest::Response) -> Result<String, String> {
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("Cannot read OpenRouter response: {error}"))?
-    {
+    loop {
+        let next_chunk = response
+            .chunk()
+            .await
+            .map_err(|error| format!("Cannot read OpenRouter response: {error}"))?;
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
             return Err(format!(
                 "OpenRouter response exceeds {MAX_RESPONSE_BYTES} bytes"
@@ -716,12 +719,14 @@ mod tests {
             .as_deref(),
             Some("API URL host must be openrouter.ai")
         );
-        assert!(LlmConfig::new(
-            "key".into(),
-            "https://openrouter.ai/api/v1".into(),
-            "model".into()
-        )
-        .is_err());
+        assert!(
+            LlmConfig::new(
+                "key".into(),
+                "https://openrouter.ai/api/v1".into(),
+                "model".into()
+            )
+            .is_err()
+        );
         assert!(LlmConfig::new("key".into(), DEFAULT_API_URL.into(), "".into()).is_err());
     }
 
