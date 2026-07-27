@@ -56,7 +56,7 @@ cargo run --release
 }
 ```
 
-仓库中的 `llm_config.example.json` 不包含真实密钥。配置页面支持 API Key 脱敏显示、显示/隐藏、`Paste` 按钮、`Cmd/Ctrl+V` 粘贴和保存前校验。保存后自动切换到 OpenRouter AI。请求超时、服务报错或模型返回非法坐标时，会自动降级到经典搜索。
+仓库中的 `llm_config.example.json` 不包含真实密钥。配置页面支持 API Key 脱敏显示、显示/隐藏、`Paste` 按钮、`Cmd/Ctrl+V` 粘贴和保存前校验。保存后自动切换到 OpenRouter AI。请求超时、服务报错或模型返回非法坐标时，最多自动尝试 3 次；界面会显示经过单行化和长度限制的失败原因，全部失败后才降级到经典搜索。重试期间仍可通过悔棋、重开、切换模式或切换 AI 取消请求。
 
 没装 Rust 的话,macOS 下直接双击 `run_wuziqi.command`,脚本会自动通过 [rustup](https://rustup.rs) 安装工具链并编译运行。
 
