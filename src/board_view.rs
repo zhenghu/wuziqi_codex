@@ -1,6 +1,6 @@
 //! 棋盘坐标换算和绘制。
 
-use crate::game::{Cell, Game, BOARD, CENTER};
+use crate::game::{BOARD, CENTER, Cell, Game};
 use macroquad::miniquad::conf::Icon;
 use macroquad::prelude::*;
 

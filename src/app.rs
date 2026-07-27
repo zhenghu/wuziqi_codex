@@ -4,7 +4,7 @@ use crate::ai::{ai_move, llm_candidate_moves};
 use crate::board_view::{self, Button, TOP_BAR, WIN_H, WIN_W};
 use crate::config_ui::{ConfigAction, LlmConfigPage};
 use crate::game::{Cell, Game, Mode, Status};
-use crate::llm_ai::{build_client, config_exists, request_move, LlmConfig, LlmMove};
+use crate::llm_ai::{LlmConfig, LlmMove, build_client, config_exists, request_move};
 use macroquad::prelude::*;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -46,7 +46,11 @@ impl LlmWorker {
             .spawn(move || {
                 runtime.block_on(async move {
                     let mut active: Option<tokio::task::JoinHandle<()>> = None;
-                    while let Some(command) = receiver.recv().await {
+                    loop {
+                        let received = receiver.recv().await;
+                        let Some(command) = received else {
+                            break;
+                        };
                         if let Some(request) = active.take() {
                             request.abort();
                         }

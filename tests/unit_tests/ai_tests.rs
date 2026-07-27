@@ -2,7 +2,7 @@ use super::super::ai::{
     ai_move, double_threat_moves, immediate_winning_moves, line_stat, llm_candidate_moves,
     near_stone, pattern_score, point_score,
 };
-use super::super::game::{Cell, BOARD, CENTER};
+use super::super::game::{BOARD, CENTER, Cell};
 use super::support::{empty_board, put};
 
 #[test]
@@ -110,9 +110,11 @@ fn llm_candidates_are_legal_and_preserve_forced_defense() {
     put(&mut board, &[(0, 7), (1, 7), (2, 7), (3, 7)], Cell::Black);
     let candidates = llm_candidate_moves(&board, Cell::White, 4);
     assert_eq!(candidates, vec![(4, 7)]);
-    assert!(candidates
-        .iter()
-        .all(|&(x, y)| x < BOARD && y < BOARD && board[y][x] == Cell::Empty));
+    assert!(
+        candidates
+            .iter()
+            .all(|&(x, y)| x < BOARD && y < BOARD && board[y][x] == Cell::Empty)
+    );
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use super::super::game::{opponent, winning_line, Cell, Game, Mode, Status, BOARD};
+use super::super::game::{BOARD, Cell, Game, Mode, Status, opponent, winning_line};
 use super::support::{empty_board, play_black_horizontal_win, put};
 
 #[test]
