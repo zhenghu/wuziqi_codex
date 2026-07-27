@@ -9,6 +9,8 @@ use macroquad::prelude::*;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use tokio::sync::mpsc as tokio_mpsc;
 
+const MAX_LLM_ATTEMPTS: u8 = 3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AiAlgorithm {
     TacticalSearch,
@@ -114,6 +116,7 @@ pub(crate) struct App {
     active_llm_config: Option<LlmConfig>,
     openrouter_status: String,
     show_config: bool,
+    llm_attempt: u8,
 }
 
 impl App {
@@ -158,6 +161,7 @@ impl App {
             active_llm_config,
             openrouter_status: openrouter_status.to_string(),
             show_config: false,
+            llm_attempt: 0,
         }
     }
 
@@ -393,12 +397,16 @@ impl App {
                     self.ai_notice.clear();
                 }
             }
-            AiAlgorithm::LargeModel if !self.ai_thinking => self.start_llm_request(),
+            AiAlgorithm::LargeModel if !self.ai_thinking => {
+                self.llm_attempt = 0;
+                self.start_llm_request(None);
+            }
             AiAlgorithm::LargeModel => self.poll_llm_request(),
         }
     }
 
-    fn start_llm_request(&mut self) {
+    fn start_llm_request(&mut self, previous_error: Option<&str>) {
+        self.llm_attempt += 1;
         self.ai_thinking = true;
         self.ai_notice.clear();
         let board = self.game.board;
@@ -409,7 +417,13 @@ impl App {
             return;
         };
         let model = config.model().to_string();
-        self.openrouter_status = "OpenRouter: connecting...".to_string();
+        self.openrouter_status = match previous_error {
+            Some(error) => {
+                let reason = llm_failure_summary(error, 28);
+                format!("Retry {}/{}: {reason}", self.llm_attempt, MAX_LLM_ATTEMPTS)
+            }
+            None => "OpenRouter: connecting...".to_string(),
+        };
         let Some(worker) = &self.llm_worker else {
             self.fallback_to_tactical("LLM worker unavailable; used fallback");
             return;
@@ -436,12 +450,23 @@ impl App {
                 self.game.place(llm_move.position.0, llm_move.position.1);
                 self.ai_thinking = false;
                 self.pending_llm = None;
+                self.llm_attempt = 0;
                 self.ai_notice = "LLM move".to_string();
             }
             Ok(Err(error)) => {
-                self.openrouter_status = "OpenRouter: call failed".to_string();
-                eprintln!("大模型落子失败，使用战术搜索: {error}");
-                self.fallback_to_tactical("LLM failed; used fallback");
+                self.pending_llm = None;
+                if should_retry_llm(self.llm_attempt) {
+                    eprintln!(
+                        "大模型落子失败，准备第 {} 次尝试: {error}",
+                        self.llm_attempt + 1
+                    );
+                    self.start_llm_request(Some(&error));
+                } else {
+                    let reason = llm_failure_summary(&error, 30);
+                    self.openrouter_status = format!("Failed: {reason}");
+                    eprintln!("大模型连续 {MAX_LLM_ATTEMPTS} 次失败，使用战术搜索: {error}");
+                    self.fallback_to_tactical(&format!("LLM failed: {reason}; fallback"));
+                }
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
@@ -455,6 +480,7 @@ impl App {
         self.place_tactical_move();
         self.ai_thinking = false;
         self.pending_llm = None;
+        self.llm_attempt = 0;
         self.ai_notice = notice.to_string();
     }
 
@@ -469,6 +495,7 @@ impl App {
             worker.cancel();
         }
         self.pending_llm = None;
+        self.llm_attempt = 0;
         self.ai_notice.clear();
     }
 
@@ -498,6 +525,15 @@ pub(crate) fn compact_text(value: &str, max_chars: usize) -> String {
     }
     let keep = max_chars.saturating_sub(3);
     format!("{}...", value.chars().take(keep).collect::<String>())
+}
+
+pub(crate) fn should_retry_llm(attempt: u8) -> bool {
+    attempt < MAX_LLM_ATTEMPTS
+}
+
+pub(crate) fn llm_failure_summary(error: &str, max_chars: usize) -> String {
+    let single_line = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact_text(&single_line, max_chars)
 }
 
 #[cfg(test)]
