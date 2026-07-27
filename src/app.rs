@@ -242,19 +242,23 @@ impl App {
     }
 
     fn draw_ai_info(&self) {
-        if self.game.mode != Mode::HumanVsAi {
-            return;
+        let color = Color::from_rgba(190, 205, 225, 255);
+        if self.game.mode == Mode::HumanVsAi {
+            let text = match self.ai_algorithm {
+                AiAlgorithm::TacticalSearch => "AI engine: Tactical Search".to_string(),
+                AiAlgorithm::LargeModel => format!("AI route: {}", self.ai_model_label()),
+            };
+            draw_text(&text, 22.0, WIN_H - 5.0, 16.0, color);
         }
-        let text = match self.ai_algorithm {
-            AiAlgorithm::TacticalSearch => "AI engine: Tactical Search".to_string(),
-            AiAlgorithm::LargeModel => format!("AI route: {}", self.ai_model_label()),
-        };
+
+        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let size = measure_text(&version, None, 16, 1.0);
         draw_text(
-            &text,
-            22.0,
+            &version,
+            WIN_W - size.width - 22.0,
             WIN_H - 5.0,
             16.0,
-            Color::from_rgba(190, 205, 225, 255),
+            color,
         );
     }
 

@@ -2,6 +2,21 @@
 
 用 Rust + [macroquad](https://github.com/not-fl3/macroquad) 编写的五子棋小游戏,支持人机对战和双人对战。附带一个逻辑完全一致的网页移植版,无需安装任何东西即可游玩。
 
+当前版本：`0.2.0-beta.1`
+
+## 版本管理
+
+项目采用[语义化版本](https://semver.org/lang/zh-CN/)：
+
+- Beta 版本使用 `主版本.次版本.修订版本-beta.序号`，例如 `0.2.0-beta.1`
+- 同一轮 Beta 修复依次升级为 `beta.2`、`beta.3`
+- 功能或兼容性目标变化时升级次版本，例如 `0.3.0-beta.1`
+- Beta 验证完成后发布对应稳定版，例如 `0.2.0`
+
+原生版以 `Cargo.toml` 的 `package.version` 为版本源，并在编译时自动显示到窗口标题和界面底部。发布时同时更新网页版 `wuziqi.html` 中的 `APP_VERSION`，并保持 `Cargo.lock` 与 README 一致。
+
+版本变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
+
 ## 玩法
 
 - 🖱️ 鼠标点击交叉点落子(默认你执黑,AI 执白)
@@ -57,6 +72,7 @@ cargo run --release
 
 ```
 ├── Cargo.toml              # Rust 项目配置 (依赖: macroquad 0.4)
+├── CHANGELOG.md            # 版本变更记录
 ├── src/
 │   ├── main.rs             # 程序入口
 │   ├── app.rs              # 主循环、输入调度与 AI 请求状态

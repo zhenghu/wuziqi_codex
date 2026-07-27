@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <link rel="icon" href="./assets/wuziqi-icon.svg" type="image/svg+xml">
-<title>Wuziqi - Gomoku</title>
+<title>Wuziqi - Gomoku v0.2.0-beta.1</title>
 <style>
   html,body{margin:0;padding:0;background:#1e2128;display:flex;justify-content:center;align-items:center;min-height:100vh;}
   canvas{box-shadow:0 8px 40px rgba(0,0,0,.5);cursor:pointer;}
@@ -16,6 +16,7 @@
 // 模式: 人机对战 (默认, 玩家执黑) / 双人对战
 // 操作: 鼠标点击落子 | R 重开 | U 悔棋 | M 切换模式
 
+const APP_VERSION='0.2.0-beta.1';
 const BOARD=15, CENTER=Math.floor(BOARD/2), CELL=40, MARGIN=40, TOP_BAR=70;
 const BOARD_PX=CELL*(BOARD-1);
 const WIN_W=MARGIN*2+BOARD_PX, WIN_H=TOP_BAR+MARGIN*2+BOARD_PX;
@@ -176,6 +177,10 @@ function frame(){
     const [cx,cy]=cellCenter(x,y);
     drawCircleLines(cx,cy,CELL*0.46,3,'rgb(60,220,100)');
   }
+
+  ctx.fillStyle='rgb(190,205,225)'; ctx.font='16px sans-serif'; ctx.textAlign='right';
+  ctx.fillText(`v${APP_VERSION}`,WIN_W-22,WIN_H-5);
+  ctx.textAlign='left';
 
   // 悬停预览
   const humanTurn=game.status==='playing'&&!(game.mode===AI_MODE&&game.turn===WHITE);
