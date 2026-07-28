@@ -1,5 +1,5 @@
-use super::super::game::{BOARD, Cell, Game, Mode, Status, opponent, winning_line};
-use super::support::{empty_board, play_black_horizontal_win, put};
+use super::{BOARD, Cell, Game, Mode, Status, opponent, winning_line};
+use crate::test_support::{empty_board, play_black_horizontal_win, put};
 
 #[test]
 fn opponent_swaps_colors_and_keeps_empty() {
@@ -62,6 +62,44 @@ fn place_rejects_out_of_bounds_without_mutating_state() {
 }
 
 #[test]
+fn final_non_winning_move_transitions_a_reachable_full_board_to_draw() {
+    let final_move = (0, 0);
+    let mut black_moves = Vec::new();
+    let mut white_moves = Vec::new();
+
+    for y in 0..BOARD {
+        for x in 0..BOARD {
+            if (x, y) == final_move {
+                continue;
+            }
+            if (x + 2 * y) % 4 < 2 {
+                black_moves.push((x, y));
+            } else {
+                white_moves.push((x, y));
+            }
+        }
+    }
+
+    assert_eq!(black_moves.len(), white_moves.len());
+    let mut game = Game::new(Mode::HumanVsHuman);
+    for ((black_x, black_y), (white_x, white_y)) in black_moves.into_iter().zip(white_moves) {
+        assert!(game.place(black_x, black_y));
+        assert!(game.place(white_x, white_y));
+    }
+
+    assert_eq!(game.status, Status::Playing);
+    assert_eq!(game.turn, Cell::Black);
+    assert_eq!(game.history.len(), BOARD * BOARD - 1);
+    assert_eq!(game.board[final_move.1][final_move.0], Cell::Empty);
+
+    assert!(game.place(final_move.0, final_move.1));
+    assert_eq!(game.status, Status::Draw);
+    assert_eq!(game.history.len(), BOARD * BOARD);
+    assert!(game.win_line.is_empty());
+    assert!(game.board.iter().flatten().all(|&cell| cell != Cell::Empty));
+}
+
+#[test]
 fn place_transitions_to_won_and_rejects_later_moves() {
     let mut game = play_black_horizontal_win(Mode::HumanVsHuman);
     assert_eq!(game.status, Status::Won(Cell::Black));
@@ -69,6 +107,21 @@ fn place_transitions_to_won_and_rejects_later_moves() {
     assert_eq!(game.win_line.len(), 5);
     assert!(!game.place(8, 8));
     assert_eq!(game.history.len(), 9);
+}
+
+#[test]
+fn undo_with_empty_history_is_a_noop() {
+    let mut game = Game::new(Mode::HumanVsAi);
+    let board_before = game.board;
+
+    game.undo();
+
+    assert_eq!(game.board, board_before);
+    assert!(game.history.is_empty());
+    assert_eq!(game.turn, Cell::Black);
+    assert_eq!(game.status, Status::Playing);
+    assert_eq!(game.mode, Mode::HumanVsAi);
+    assert!(game.win_line.is_empty());
 }
 
 #[test]

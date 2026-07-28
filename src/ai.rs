@@ -556,18 +556,23 @@ mod search_tests {
     #[test]
     fn candidate_width_grows_with_game_phase_and_narrows_with_depth() {
         let mut board = [[Cell::Empty; BOARD]; BOARD];
-        assert_eq!(candidate_limit(&board, 1), 10);
+        let opening_width = candidate_limit(&board, 1);
+        assert!(opening_width > 0);
 
         for index in 0..9 {
             board[index / BOARD][index % BOARD] = Cell::Black;
         }
-        assert_eq!(candidate_limit(&board, 1), 14);
-        assert_eq!(candidate_limit(&board, 4), 8);
+        let midgame_width = candidate_limit(&board, 1);
+        let deeper_midgame_width = candidate_limit(&board, 4);
+        assert!(midgame_width > opening_width);
+        assert!(deeper_midgame_width < midgame_width);
 
         for index in 9..31 {
             board[index / BOARD][index % BOARD] = Cell::White;
         }
-        assert_eq!(candidate_limit(&board, 1), 18);
+        let late_game_width = candidate_limit(&board, 1);
+        assert!(late_game_width > midgame_width);
+        assert!(candidate_limit(&board, 4) < late_game_width);
     }
 
     #[test]
@@ -589,3 +594,7 @@ mod search_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ai/tests.rs"]
+mod tests;

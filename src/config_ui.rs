@@ -401,6 +401,9 @@ fn visible_tail(value: &str, max_chars: usize) -> String {
     if count <= max_chars {
         return value.to_string();
     }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
     format!(
         "...{}",
         value
@@ -413,6 +416,9 @@ fn visible_tail(value: &str, max_chars: usize) -> String {
 fn visible_head(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
     }
     format!(
         "{}...",
@@ -533,6 +539,19 @@ mod tests {
     }
 
     #[test]
+    fn text_truncation_preserves_unicode_character_boundaries() {
+        assert_eq!(visible_head("🚀模型配置", 4), "🚀...");
+        assert_eq!(visible_tail("配置模型🚀", 4), "...🚀");
+    }
+
+    #[test]
+    fn text_truncation_respects_limits_smaller_than_the_ellipsis() {
+        assert_eq!(visible_head("abcdef", 0), "");
+        assert_eq!(visible_head("abcdef", 2), "..");
+        assert_eq!(visible_tail("abcdef", 2), "..");
+    }
+
+    #[test]
     fn pasting_an_api_key_replaces_the_previous_value() {
         let mut page = LlmConfigPage::new(None, None);
         page.active = ConfigField::ApiKey;
@@ -541,6 +560,18 @@ mod tests {
         page.apply_pasted_value("  new-key\n");
 
         assert_eq!(page.api_key, "new-key");
+        assert!(page.message.is_empty());
+    }
+
+    #[test]
+    fn pasting_unicode_replaces_the_previous_model_value() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.active = ConfigField::Model;
+        page.model = "old-model".to_string();
+
+        page.apply_pasted_value("  本地模型🦀\n");
+
+        assert_eq!(page.model, "本地模型🦀");
         assert!(page.message.is_empty());
     }
 

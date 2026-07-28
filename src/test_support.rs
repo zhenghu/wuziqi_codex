@@ -1,18 +1,18 @@
-use super::super::game::{BOARD, Cell, Game, Mode};
+use crate::game::{BOARD, Cell, Game, Mode};
 
-pub(super) type Board = [[Cell; BOARD]; BOARD];
+pub(crate) type Board = [[Cell; BOARD]; BOARD];
 
-pub(super) fn empty_board() -> Board {
+pub(crate) fn empty_board() -> Board {
     [[Cell::Empty; BOARD]; BOARD]
 }
 
-pub(super) fn put(board: &mut Board, stones: &[(usize, usize)], cell: Cell) {
+pub(crate) fn put(board: &mut Board, stones: &[(usize, usize)], cell: Cell) {
     for &(x, y) in stones {
         board[y][x] = cell;
     }
 }
 
-pub(super) fn play_black_horizontal_win(mode: Mode) -> Game {
+pub(crate) fn play_black_horizontal_win(mode: Mode) -> Game {
     let mut game = Game::new(mode);
     for &(x, y) in &[
         (3, 7),

@@ -126,3 +126,7 @@ pub(crate) fn winning_line(
     }
     None
 }
+
+#[cfg(test)]
+#[path = "game/tests.rs"]
+mod tests;

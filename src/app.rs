@@ -38,6 +38,17 @@ struct LlmWorker {
     commands: tokio_mpsc::UnboundedSender<LlmCommand>,
 }
 
+trait LlmRequestWorker {
+    fn request(
+        &self,
+        config: LlmConfig,
+        board: [[Cell; crate::game::BOARD]; crate::game::BOARD],
+        candidates: Vec<(usize, usize)>,
+    ) -> Result<Receiver<Result<LlmMove, String>>, String>;
+
+    fn cancel(&self);
+}
+
 impl LlmWorker {
     fn new() -> Result<Self, String> {
         let cloud_client = build_openrouter_client()?;
@@ -112,12 +123,27 @@ impl LlmWorker {
     }
 }
 
+impl LlmRequestWorker for LlmWorker {
+    fn request(
+        &self,
+        config: LlmConfig,
+        board: [[Cell; crate::game::BOARD]; crate::game::BOARD],
+        candidates: Vec<(usize, usize)>,
+    ) -> Result<Receiver<Result<LlmMove, String>>, String> {
+        LlmWorker::request(self, config, board, candidates)
+    }
+
+    fn cancel(&self) {
+        LlmWorker::cancel(self);
+    }
+}
+
 pub(crate) struct App {
     game: Game,
     ai_algorithm: AiAlgorithm,
     ai_thinking: bool,
     pending_llm: Option<PendingLlmRequest>,
-    llm_worker: Option<LlmWorker>,
+    llm_worker: Option<Box<dyn LlmRequestWorker>>,
     ai_notice: String,
     config_page: LlmConfigPage,
     active_llm_config: Option<LlmConfig>,
@@ -149,8 +175,8 @@ impl App {
             .as_ref()
             .map(|config| format!("{}: not connected", config.backend().label()))
             .unwrap_or_else(|| "LLM: not configured".to_string());
-        let llm_worker = match LlmWorker::new() {
-            Ok(worker) => Some(worker),
+        let llm_worker: Option<Box<dyn LlmRequestWorker>> = match LlmWorker::new() {
+            Ok(worker) => Some(Box::new(worker)),
             Err(error) => {
                 eprintln!("LLM worker unavailable: {error}");
                 None
@@ -536,6 +562,9 @@ pub(crate) fn compact_text(value: &str, max_chars: usize) -> String {
     if count <= max_chars {
         return value.to_string();
     }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
     let keep = max_chars.saturating_sub(3);
     format!("{}...", value.chars().take(keep).collect::<String>())
 }
@@ -560,11 +589,15 @@ mod worker_tests {
     fn cancelling_the_worker_drops_the_in_flight_request() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
+        let (request_started_sender, request_started_receiver) = mpsc::channel();
+        let (server_shutdown_sender, server_shutdown_receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
-            std::thread::sleep(Duration::from_secs(2));
+            let bytes_read = stream.read(&mut request).unwrap();
+            assert!(bytes_read > 0);
+            request_started_sender.send(()).unwrap();
+            let _ = server_shutdown_receiver.recv_timeout(Duration::from_secs(5));
         });
         let config = LlmConfig::new_unchecked(
             LlmBackend::Local,
@@ -581,11 +614,22 @@ mod worker_tests {
             )
             .unwrap();
 
+        request_started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the server should receive the request before it is cancelled");
         worker.cancel();
 
+        let cancellation_result = result.recv_timeout(Duration::from_secs(1));
+        let _ = server_shutdown_sender.send(());
+        server.join().unwrap();
+
         assert!(matches!(
-            result.recv_timeout(Duration::from_secs(1)),
+            cancellation_result,
             Err(mpsc::RecvTimeoutError::Disconnected)
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "app/tests.rs"]
+mod tests;
