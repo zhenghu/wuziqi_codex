@@ -7,6 +7,11 @@
 ### 新增
 
 - OpenRouter 请求失败后显示失败原因，最多自动尝试 3 次，再降级到战术搜索
+- 支持 Ollama、LM Studio 和 llama.cpp 等本地 OpenAI-compatible 大模型服务
+
+### 改进
+
+- 本地后端只允许数字回环地址，且不会保存或发送 OpenRouter API Key
 
 ## [0.2.0-beta.1] - 2026-07-27
 

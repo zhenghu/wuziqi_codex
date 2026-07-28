@@ -26,7 +26,7 @@
 - `A` 切换 经典战术搜索 / 大模型 AI（原生版）
 - `C` 打开大模型配置页面（原生版）
 
-人机模式下，棋盘底部会持续显示当前 AI 引擎；OpenRouter 首次成功返回后，显示响应中的实际模型 ID，以及响应提供的供应商信息。
+人机模式下，棋盘底部会持续显示当前 AI 引擎；大模型首次成功返回后，会显示实际模型 ID，以及响应提供的供应商信息。
 
 ## 运行
 
@@ -38,7 +38,9 @@ cargo run --release
 
 ### 大模型 AI（原生版）
 
-大模型模式使用 OpenRouter Chat Completions API。点击顶部 `Config (C)` 或按 `C` 打开配置页面，可填写 OpenRouter API Key 和模型名称；为防止密钥被发送到第三方服务器，API 地址仅接受 OpenRouter 官方 HTTPS 端点。配置保存在系统用户配置目录，并在 macOS/Linux 上设置为仅当前用户可读写。
+大模型模式支持 OpenRouter 和本地 OpenAI-compatible 服务。点击顶部 `Config (C)` 或按 `C` 打开配置页面，选择后端并填写模型与 API 地址。OpenRouter 后端需要 API Key，且只接受 OpenRouter 官方 HTTPS 端点；本地后端默认连接 Ollama，也兼容提供 `/v1/chat/completions` 的 LM Studio 和 llama.cpp。
+
+为避免云端密钥泄露，本地后端只接受 `http` 或 `https` 的数字回环地址（`127.0.0.1` 或 `::1`，不接受 `localhost`），并且请求本地服务时不会发送 OpenRouter API Key。配置保存在系统用户配置目录，并在 macOS/Linux 上设置为仅当前用户可读写。
 
 macOS 配置路径为 `~/Library/Application Support/Wuziqi/llm_config.json`。旧版项目目录中的 `llm_config.json` 会在首次启动时自动迁移到新位置，并归档为 `llm_config.json.migrated`，避免误删原文件。也可以复制示例文件后直接编辑 JSON：
 
@@ -50,13 +52,40 @@ cargo run --release
 
 ```json
 {
+  "backend": "openrouter",
   "api_key": "YOUR_OPENROUTER_API_KEY",
   "api_url": "https://openrouter.ai/api/v1/chat/completions",
   "model": "openai/gpt-5-mini"
 }
 ```
 
-仓库中的 `llm_config.example.json` 不包含真实密钥。配置页面支持 API Key 脱敏显示、显示/隐藏、`Paste` 按钮、`Cmd/Ctrl+V` 粘贴和保存前校验。保存后自动切换到 OpenRouter AI。请求超时、服务报错或模型返回非法坐标时，最多自动尝试 3 次；界面会显示经过单行化和长度限制的失败原因，全部失败后才降级到经典搜索。重试期间仍可通过悔棋、重开、切换模式或切换 AI 取消请求。
+仓库中的 `llm_config.example.json` 不包含真实密钥。配置页面支持 API Key 脱敏显示、显示/隐藏、`Paste` 按钮、`Cmd/Ctrl+V` 粘贴和保存前校验。保存后自动切换到大模型 AI。请求超时、服务报错或模型返回非法坐标时，最多自动尝试 3 次；界面会显示经过单行化和长度限制的失败原因，全部失败后才降级到经典搜索。重试期间仍可通过悔棋、重开、切换模式或切换 AI 取消请求。
+
+#### 使用本地 Ollama
+
+安装 Ollama 后启动本地服务：
+
+```bash
+ollama serve
+```
+
+如果 Ollama 桌面应用已经在后台运行，无需再次执行 `ollama serve`。然后在另一个终端下载默认推荐的轻量模型：
+
+```bash
+ollama pull qwen3:4b
+```
+
+在配置页面选择 `Local` 后端即可使用默认地址；也可以直接保存以下配置：
+
+```json
+{
+  "backend": "local",
+  "api_url": "http://127.0.0.1:11434/v1/chat/completions",
+  "model": "qwen3:4b"
+}
+```
+
+使用 LM Studio 或 llama.cpp 时，先启动其 OpenAI-compatible 本地服务器，再把 `api_url` 改为对应数字回环地址，并将 `model` 改为服务暴露的模型 ID。本地配置不需要 `api_key`，应用不会把云端 Key 附加到本地请求。
 
 没装 Rust 的话,macOS 下直接双击 `run_wuziqi.command`,脚本会自动通过 [rustup](https://rustup.rs) 安装工具链并编译运行。
 
@@ -80,8 +109,11 @@ cargo run --release
 │   ├── board_view.rs       # 棋盘绘制与坐标换算
 │   ├── ai.rs               # Rust 版 AI 搜索
 │   ├── config_ui.rs        # 大模型配置页面
-│   └── llm_ai.rs           # 大模型 API、提示词、结果校验
-├── llm_config.example.json # OpenRouter 配置示例（不含真实 Key）
+│   ├── llm_ai.rs           # 大模型共享配置、提示词与结果校验
+│   └── llm_ai/
+│       ├── openrouter.rs   # OpenRouter 请求与响应适配
+│       └── local.rs        # 本地兼容请求与安全校验
+├── llm_config.example.json # 大模型配置示例（不含真实 Key）
 ├── ai.js                   # 网页版 AI 搜索
 ├── wuziqi.html             # 网页版游戏界面与交互
 ├── tests/unit_tests/mod.rs # Rust 单元测试

@@ -1,4 +1,7 @@
-//! 通过 OpenRouter Chat Completions API 从战术引擎筛选出的合法点中选择落子。
+//! 大模型共享配置、提示词、响应解析与后端分发。
+
+mod local;
+mod openrouter;
 
 use crate::game::{BOARD, Cell};
 use serde::{Deserialize, Serialize};
@@ -11,11 +14,12 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 const CONFIG_FILE_NAME: &str = "llm_config.json";
-pub(crate) const DEFAULT_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-pub(crate) const DEFAULT_MODEL: &str = "openai/gpt-5-mini";
+pub(crate) const DEFAULT_OPENROUTER_API_URL: &str = openrouter::DEFAULT_API_URL;
+pub(crate) const DEFAULT_OPENROUTER_MODEL: &str = openrouter::DEFAULT_MODEL;
+pub(crate) const DEFAULT_LOCAL_API_URL: &str = local::DEFAULT_API_URL;
+pub(crate) const DEFAULT_LOCAL_MODEL: &str = local::DEFAULT_MODEL;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_ERROR_TEXT_CHARS: usize = 512;
 
@@ -177,8 +181,47 @@ pub(crate) fn config_exists() -> bool {
     config_path().is_ok_and(|path| path.exists()) || legacy_config_path().exists()
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum LlmBackend {
+    #[default]
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    #[serde(rename = "local")]
+    Local,
+}
+
+impl LlmBackend {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "OpenRouter",
+            Self::Local => "Local",
+        }
+    }
+
+    pub(crate) fn default_api_url(self) -> &'static str {
+        match self {
+            Self::OpenRouter => DEFAULT_OPENROUTER_API_URL,
+            Self::Local => DEFAULT_LOCAL_API_URL,
+        }
+    }
+
+    pub(crate) fn default_model(self) -> &'static str {
+        match self {
+            Self::OpenRouter => DEFAULT_OPENROUTER_MODEL,
+            Self::Local => DEFAULT_LOCAL_MODEL,
+        }
+    }
+
+    pub(crate) fn requires_api_key(self) -> bool {
+        matches!(self, Self::OpenRouter)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct LlmConfig {
+    #[serde(default)]
+    backend: LlmBackend,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     api_key: String,
     api_url: String,
     model: String,
@@ -201,30 +244,25 @@ impl LlmMove {
 }
 
 impl LlmConfig {
-    pub(crate) fn new(api_key: String, api_url: String, model: String) -> ConfigResult<Self> {
-        let api_key = api_key.trim().to_string();
+    pub(crate) fn new(
+        backend: LlmBackend,
+        api_key: String,
+        api_url: String,
+        model: String,
+    ) -> ConfigResult<Self> {
+        let mut api_key = api_key.trim().to_string();
         let api_url = api_url.trim().trim_end_matches('/').to_string();
         let model = model.trim().to_string();
-        if api_key.is_empty() {
+        if backend.requires_api_key() && api_key.is_empty() {
             return Err(ConfigError::Invalid(
                 "OpenRouter API Key is required".to_string(),
             ));
         }
         if model.is_empty() {
-            return Err(ConfigError::Invalid(
-                "OpenRouter model name is required".to_string(),
-            ));
+            return Err(ConfigError::Invalid("Model name is required".to_string()));
         }
         let parsed = reqwest::Url::parse(&api_url)
             .map_err(|error| ConfigError::Invalid(format!("Invalid API URL: {error}")))?;
-        if parsed.scheme() != "https" {
-            return Err(ConfigError::Invalid("API URL must use HTTPS".to_string()));
-        }
-        if parsed.host_str() != Some("openrouter.ai") {
-            return Err(ConfigError::Invalid(
-                "API URL host must be openrouter.ai".to_string(),
-            ));
-        }
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(ConfigError::Invalid(
                 "API URL must not contain credentials".to_string(),
@@ -235,12 +273,20 @@ impl LlmConfig {
                 "API URL must not contain a query or fragment".to_string(),
             ));
         }
-        if parsed.path() != "/api/v1/chat/completions" {
-            return Err(ConfigError::Invalid(
-                "OpenRouter API URL must use /api/v1/chat/completions".to_string(),
-            ));
+
+        match backend {
+            LlmBackend::OpenRouter => {
+                openrouter::validate_url(&parsed).map_err(ConfigError::Invalid)?;
+            }
+            LlmBackend::Local => {
+                local::validate_url(&parsed).map_err(ConfigError::Invalid)?;
+                // A cloud credential must never be retained or sent while the
+                // local transport is selected.
+                api_key.clear();
+            }
         }
         Ok(Self {
+            backend,
             api_key,
             api_url,
             model,
@@ -248,8 +294,14 @@ impl LlmConfig {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_unchecked(api_key: String, api_url: String, model: String) -> Self {
+    pub(crate) fn new_unchecked(
+        backend: LlmBackend,
+        api_key: String,
+        api_url: String,
+        model: String,
+    ) -> Self {
         Self {
+            backend,
             api_key,
             api_url,
             model,
@@ -306,14 +358,22 @@ impl LlmConfig {
     fn read_from_path(path: &Path) -> ConfigResult<(Self, bool)> {
         let text =
             std::fs::read_to_string(path).map_err(|error| ConfigError::io("read", path, error))?;
-        let mut raw: Self = serde_json::from_str(&text).map_err(|source| ConfigError::Json {
+        let value: Value = serde_json::from_str(&text).map_err(|source| ConfigError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let backend_was_missing = value.get("backend").is_none();
+        let api_key_was_present = value.get("api_key").is_some();
+        let mut raw: Self = serde_json::from_value(value).map_err(|source| ConfigError::Json {
             path: path.to_path_buf(),
             source,
         })?;
         let repaired = repair_paste_artifact(&raw.api_key);
-        let changed = repaired != raw.api_key;
+        let changed = repaired != raw.api_key
+            || backend_was_missing
+            || (raw.backend == LlmBackend::Local && api_key_was_present);
         raw.api_key = repaired;
-        let config = Self::new(raw.api_key, raw.api_url, raw.model)?;
+        let config = Self::new(raw.backend, raw.api_key, raw.api_url, raw.model)?;
         Ok((config, changed))
     }
 
@@ -368,6 +428,10 @@ impl LlmConfig {
         &self.api_key
     }
 
+    pub(crate) fn backend(&self) -> LlmBackend {
+        self.backend
+    }
+
     pub(crate) fn api_url(&self) -> &str {
         &self.api_url
     }
@@ -397,21 +461,6 @@ fn repair_paste_artifact(api_key: &str) -> String {
 struct ChatMessage {
     role: &'static str,
     content: String,
-}
-
-#[derive(Serialize)]
-struct ChatCompletionsRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage>,
-    max_completion_tokens: u32,
-    temperature: f32,
-    reasoning: ReasoningConfig,
-}
-
-#[derive(Serialize)]
-struct ReasoningConfig {
-    effort: &'static str,
-    exclude: bool,
 }
 
 fn board_text(board: &[[Cell; BOARD]; BOARD]) -> String {
@@ -450,7 +499,17 @@ fn api_error_message(value: &Value) -> Option<&str> {
     value
         .pointer("/error/message")
         .and_then(Value::as_str)
+        .or_else(|| value.get("error").and_then(Value::as_str))
         .or_else(|| value.get("message").and_then(Value::as_str))
+}
+
+fn error_detail(text: &str) -> String {
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        "unknown API error".to_string()
+    } else {
+        truncate_text(&single_line, MAX_ERROR_TEXT_CHARS)
+    }
 }
 
 fn parse_move(text: &str) -> Option<(usize, usize)> {
@@ -487,55 +546,55 @@ pub(crate) async fn request_move(
         board_text(board),
         candidates
     );
-    let request = ChatCompletionsRequest {
-        model: &config.model,
-        messages: vec![
-            ChatMessage {
-                role: "system",
-                content: "你是五子棋专家。只输出一个 JSON 对象，例如 {\"x\":7,\"y\":7}，不要解释。"
-                    .to_string(),
-            },
-            ChatMessage {
-                role: "user",
-                content: prompt,
-            },
-        ],
-        max_completion_tokens: 1_024,
-        temperature: 0.2,
-        reasoning: ReasoningConfig {
-            effort: "minimal",
-            exclude: true,
+    let messages = [
+        ChatMessage {
+            role: "system",
+            content: "你是五子棋专家。只输出一个 JSON 对象，例如 {\"x\":7,\"y\":7}，不要解释。"
+                .to_string(),
         },
+        ChatMessage {
+            role: "user",
+            content: prompt,
+        },
+    ];
+    let response = match config.backend {
+        LlmBackend::OpenRouter => {
+            openrouter::send_request(
+                client,
+                &config.api_url,
+                &config.api_key,
+                &config.model,
+                &messages,
+            )
+            .await?
+        }
+        LlmBackend::Local => {
+            local::send_request(client, &config.api_url, &config.model, &messages).await?
+        }
     };
-
-    let response = client
-        .post(&config.api_url)
-        .bearer_auth(&config.api_key)
-        .header("X-OpenRouter-Title", "Wuziqi")
-        .json(&request)
-        .send()
-        .await
-        .map_err(|error| format!("OpenRouter request failed: {error}"))?;
     let status = response.status();
-    let body = read_limited_body(response).await?;
+    let body = read_limited_body(response, config.backend.label()).await?;
     let parsed = serde_json::from_str::<Value>(&body);
     if !status.is_success() {
         let detail = parsed
             .as_ref()
             .ok()
             .and_then(api_error_message)
-            .unwrap_or("unknown API error");
+            .unwrap_or(&body);
         return Err(format!(
-            "OpenRouter HTTP {}: {}",
+            "{} HTTP {}: {}",
+            config.backend.label(),
             status.as_u16(),
-            truncate_text(detail, MAX_ERROR_TEXT_CHARS)
+            error_detail(detail)
         ));
     }
-    let value = parsed.map_err(|error| format!("OpenRouter returned invalid JSON: {error}"))?;
+    let value = parsed
+        .map_err(|error| format!("{} returned invalid JSON: {error}", config.backend.label()))?;
     if let Some(error) = api_error_message(&value) {
         return Err(format!(
-            "OpenRouter error: {}",
-            truncate_text(error, MAX_ERROR_TEXT_CHARS)
+            "{} error: {}",
+            config.backend.label(),
+            error_detail(error)
         ));
     }
     let text = response_text(&value).ok_or_else(|| {
@@ -548,7 +607,8 @@ pub(crate) async fn request_move(
             .and_then(Value::as_u64)
             .unwrap_or(0);
         format!(
-            "OpenRouter response has no text (finish_reason={finish_reason}, reasoning_tokens={reasoning_tokens})"
+            "{} response has no text (finish_reason={finish_reason}, reasoning_tokens={reasoning_tokens})",
+            config.backend.label()
         )
     })?;
     let chosen = parse_move(&text).ok_or_else(|| {
@@ -560,17 +620,10 @@ pub(crate) async fn request_move(
     if !candidates.contains(&chosen) {
         return Err(format!("模型返回了候选集外的落点: {chosen:?}"));
     }
-    let model = value
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| "OpenRouter response is missing the routed model".to_string())?
-        .to_string();
-    let provider = value
-        .get("provider")
-        .and_then(Value::as_str)
-        .filter(|provider| !provider.is_empty())
-        .map(str::to_string);
+    let (model, provider) = match config.backend {
+        LlmBackend::OpenRouter => openrouter::resolve_route(&value)?,
+        LlmBackend::Local => local::resolve_route(&value, &config.model),
+    };
     Ok(LlmMove {
         position: chosen,
         model,
@@ -578,32 +631,36 @@ pub(crate) async fn request_move(
     })
 }
 
-pub(crate) fn build_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| format!("Cannot create OpenRouter client: {error}"))
+pub(crate) fn build_openrouter_client() -> Result<reqwest::Client, String> {
+    openrouter::build_client()
 }
 
-async fn read_limited_body(mut response: reqwest::Response) -> Result<String, String> {
+pub(crate) fn build_local_client() -> Result<reqwest::Client, String> {
+    local::build_client()
+}
+
+async fn read_limited_body(
+    mut response: reqwest::Response,
+    backend_label: &str,
+) -> Result<String, String> {
     let mut body = Vec::new();
     loop {
         let next_chunk = response
             .chunk()
             .await
-            .map_err(|error| format!("Cannot read OpenRouter response: {error}"))?;
+            .map_err(|error| format!("Cannot read {backend_label} response: {error}"))?;
         let Some(chunk) = next_chunk else {
             break;
         };
         if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
             return Err(format!(
-                "OpenRouter response exceeds {MAX_RESPONSE_BYTES} bytes"
+                "{backend_label} response exceeds {MAX_RESPONSE_BYTES} bytes"
             ));
         }
         body.extend_from_slice(&chunk);
     }
-    String::from_utf8(body).map_err(|error| format!("OpenRouter response is not UTF-8: {error}"))
+    String::from_utf8(body)
+        .map_err(|error| format!("{backend_label} response is not UTF-8: {error}"))
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -621,6 +678,7 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn parses_json_and_plain_coordinates() {
@@ -631,11 +689,21 @@ mod tests {
     }
 
     #[test]
-    fn extracts_openrouter_chat_completion_text() {
-        let value: Value = serde_json::json!({
+    fn extracts_openai_compatible_chat_completion_text() {
+        let string_content: Value = serde_json::json!({
             "choices": [{"message": {"role": "assistant", "content": "{\"x\":1,\"y\":2}"}}]
         });
-        assert_eq!(response_text(&value).as_deref(), Some("{\"x\":1,\"y\":2}"));
+        let array_content: Value = serde_json::json!({
+            "choices": [{"message": {"content": [{"type": "text", "text": "{\"x\":3,\"y\":4}"}]}}]
+        });
+        assert_eq!(
+            response_text(&string_content).as_deref(),
+            Some("{\"x\":1,\"y\":2}")
+        );
+        assert_eq!(
+            response_text(&array_content).as_deref(),
+            Some("{\"x\":3,\"y\":4}")
+        );
     }
 
     #[test]
@@ -652,36 +720,19 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_limits_reasoning_and_reserves_completion_tokens() {
-        let request = ChatCompletionsRequest {
-            model: DEFAULT_MODEL,
-            messages: vec![],
-            max_completion_tokens: 1_024,
-            temperature: 0.2,
-            reasoning: ReasoningConfig {
-                effort: "minimal",
-                exclude: true,
-            },
-        };
-        let value = serde_json::to_value(request).unwrap();
-        assert_eq!(value["max_completion_tokens"], 1_024);
-        assert_eq!(value["reasoning"]["effort"], "minimal");
-        assert_eq!(value["reasoning"]["exclude"], true);
-        assert!(value.get("max_tokens").is_none());
-    }
-
-    #[test]
-    fn parses_json_configuration() {
+    fn legacy_json_configuration_defaults_to_openrouter() {
         let raw = r#"{
             "api_key": "sk-or-test",
             "api_url": "https://openrouter.ai/api/v1/chat/completions",
             "model": "openai/gpt-5-mini"
         }"#;
         let parsed: LlmConfig = serde_json::from_str(raw).unwrap();
-        let config = LlmConfig::new(parsed.api_key, parsed.api_url, parsed.model).unwrap();
+        let config =
+            LlmConfig::new(parsed.backend, parsed.api_key, parsed.api_url, parsed.model).unwrap();
+        assert_eq!(config.backend(), LlmBackend::OpenRouter);
         assert_eq!(config.api_key(), "sk-or-test");
-        assert_eq!(config.api_url(), DEFAULT_API_URL);
-        assert_eq!(config.model(), DEFAULT_MODEL);
+        assert_eq!(config.api_url(), DEFAULT_OPENROUTER_API_URL);
+        assert_eq!(config.model(), DEFAULT_OPENROUTER_MODEL);
     }
 
     #[test]
@@ -693,12 +744,37 @@ mod tests {
     }
 
     #[test]
-    fn validates_manual_configuration() {
-        assert!(LlmConfig::new("key".into(), DEFAULT_API_URL.into(), "model".into()).is_ok());
-        assert!(LlmConfig::new("".into(), DEFAULT_API_URL.into(), "model".into()).is_err());
-        assert!(LlmConfig::new("key".into(), "not-a-url".into(), "model".into()).is_err());
+    fn validates_openrouter_configuration() {
+        assert!(
+            LlmConfig::new(
+                LlmBackend::OpenRouter,
+                "key".into(),
+                DEFAULT_OPENROUTER_API_URL.into(),
+                "model".into()
+            )
+            .is_ok()
+        );
+        assert!(
+            LlmConfig::new(
+                LlmBackend::OpenRouter,
+                "".into(),
+                DEFAULT_OPENROUTER_API_URL.into(),
+                "model".into()
+            )
+            .is_err()
+        );
+        assert!(
+            LlmConfig::new(
+                LlmBackend::OpenRouter,
+                "key".into(),
+                "not-a-url".into(),
+                "model".into()
+            )
+            .is_err()
+        );
         assert_eq!(
             LlmConfig::new(
+                LlmBackend::OpenRouter,
                 "key".into(),
                 "http://openrouter.ai/api/v1/chat/completions".into(),
                 "model".into()
@@ -706,10 +782,11 @@ mod tests {
             .err()
             .map(|error| error.to_string())
             .as_deref(),
-            Some("API URL must use HTTPS")
+            Some("OpenRouter API URL must use HTTPS")
         );
         assert_eq!(
             LlmConfig::new(
+                LlmBackend::OpenRouter,
                 "key".into(),
                 "https://example.com/api/v1/chat/completions".into(),
                 "model".into()
@@ -717,17 +794,65 @@ mod tests {
             .err()
             .map(|error| error.to_string())
             .as_deref(),
-            Some("API URL host must be openrouter.ai")
+            Some("OpenRouter API URL host must be openrouter.ai")
         );
         assert!(
             LlmConfig::new(
+                LlmBackend::OpenRouter,
                 "key".into(),
                 "https://openrouter.ai/api/v1".into(),
                 "model".into()
             )
             .is_err()
         );
-        assert!(LlmConfig::new("key".into(), DEFAULT_API_URL.into(), "".into()).is_err());
+        assert!(
+            LlmConfig::new(
+                LlmBackend::OpenRouter,
+                "key".into(),
+                DEFAULT_OPENROUTER_API_URL.into(),
+                "".into()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_configuration_accepts_only_numeric_loopback_chat_endpoints() {
+        for url in [
+            DEFAULT_LOCAL_API_URL,
+            "http://[::1]:1234/v1/chat/completions",
+            "https://127.0.0.1:1234/v1/chat/completions",
+        ] {
+            let config = LlmConfig::new(
+                LlmBackend::Local,
+                "cloud-secret".into(),
+                url.into(),
+                "model".into(),
+            )
+            .unwrap();
+            assert!(config.api_key().is_empty());
+        }
+
+        for url in [
+            "http://localhost:11434/v1/chat/completions",
+            "http://127.0.0.2:11434/v1/chat/completions",
+            "http://192.168.1.10:11434/v1/chat/completions",
+            "http://0.0.0.0:11434/v1/chat/completions",
+            "http://127.0.0.1.evil.example:11434/v1/chat/completions",
+            "https://example.com/v1/chat/completions",
+            "file://127.0.0.1/v1/chat/completions",
+            "http://user:password@127.0.0.1:11434/v1/chat/completions",
+            "http://127.0.0.1:11434/v1/chat/completions?secret=value",
+            "http://127.0.0.1:11434/v1/chat/completions#fragment",
+            "http://127.0.0.1:11434/api/v1/chat/completions",
+            "http://[::ffff:127.0.0.1]:11434/v1/chat/completions",
+        ] {
+            assert!(
+                LlmConfig::new(LlmBackend::Local, String::new(), url.into(), "model".into())
+                    .is_err(),
+                "unexpectedly accepted {url}"
+            );
+        }
     }
 
     #[test]
@@ -748,7 +873,7 @@ mod tests {
         std::fs::write(
             &legacy,
             format!(
-                r#"{{"api_key":"{legacy_key}","api_url":"{DEFAULT_API_URL}","model":"model"}}"#
+                r#"{{"api_key":"{legacy_key}","api_url":"{DEFAULT_OPENROUTER_API_URL}","model":"model"}}"#
             ),
         )
         .unwrap();
@@ -758,6 +883,7 @@ mod tests {
         let loaded = LlmConfig::load_with_paths(&current, &legacy).unwrap();
 
         assert_eq!(loaded.api_key(), legacy_key.trim_end_matches('v'));
+        assert_eq!(loaded.backend(), LlmBackend::OpenRouter);
         assert!(current.exists());
         assert!(!legacy.exists());
         assert!(migrated_legacy_config_path(&legacy).exists());
@@ -773,6 +899,106 @@ mod tests {
         let (migrated, repaired) = LlmConfig::read_from_path(&current).unwrap();
         assert_eq!(migrated.model(), "model");
         assert!(!repaired);
+        let migrated_json: Value =
+            serde_json::from_str(&std::fs::read_to_string(&current).unwrap()).unwrap();
+        assert_eq!(migrated_json["backend"], "openrouter");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn upgrades_a_current_three_field_configuration_in_place() {
+        let unique = format!(
+            "wuziqi-schema-upgrade-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let current = root.join(CONFIG_FILE_NAME);
+        let missing_legacy = root.join("missing").join(CONFIG_FILE_NAME);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &current,
+            format!(
+                r#"{{"api_key":"key","api_url":"{DEFAULT_OPENROUTER_API_URL}","model":"model"}}"#
+            ),
+        )
+        .unwrap();
+
+        let loaded = LlmConfig::load_with_paths(&current, &missing_legacy).unwrap();
+
+        assert_eq!(loaded.backend(), LlmBackend::OpenRouter);
+        let upgraded: Value =
+            serde_json::from_str(&std::fs::read_to_string(&current).unwrap()).unwrap();
+        assert_eq!(upgraded["backend"], "openrouter");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_configuration_round_trips_without_an_api_key() {
+        let unique = format!(
+            "wuziqi-local-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let path = root.join(CONFIG_FILE_NAME);
+        let config = LlmConfig::new(
+            LlmBackend::Local,
+            "must-be-cleared".into(),
+            DEFAULT_LOCAL_API_URL.into(),
+            DEFAULT_LOCAL_MODEL.into(),
+        )
+        .unwrap();
+
+        config.save_to_path(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("must-be-cleared"));
+        assert!(!text.contains("api_key"));
+        let (loaded, changed) = LlmConfig::read_from_path(&path).unwrap();
+        assert_eq!(loaded.backend(), LlmBackend::Local);
+        assert_eq!(loaded.api_url(), DEFAULT_LOCAL_API_URL);
+        assert_eq!(loaded.model(), DEFAULT_LOCAL_MODEL);
+        assert!(loaded.api_key().is_empty());
+        assert!(!changed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loading_local_configuration_removes_a_stored_cloud_key() {
+        let unique = format!(
+            "wuziqi-local-key-cleanup-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let current = root.join(CONFIG_FILE_NAME);
+        let missing_legacy = root.join("missing").join(CONFIG_FILE_NAME);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &current,
+            format!(
+                r#"{{"backend":"local","api_key":"cloud-secret","api_url":"{DEFAULT_LOCAL_API_URL}","model":"{DEFAULT_LOCAL_MODEL}"}}"#
+            ),
+        )
+        .unwrap();
+
+        let loaded = LlmConfig::load_with_paths(&current, &missing_legacy).unwrap();
+
+        assert!(loaded.api_key().is_empty());
+        let rewritten = std::fs::read_to_string(&current).unwrap();
+        assert!(!rewritten.contains("cloud-secret"));
+        assert!(!rewritten.contains("api_key"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -788,11 +1014,21 @@ mod tests {
         );
         let root = std::env::temp_dir().join(unique);
         let path = root.join(CONFIG_FILE_NAME);
-        let original =
-            LlmConfig::new("old-key".into(), DEFAULT_API_URL.into(), "old".into()).unwrap();
+        let original = LlmConfig::new(
+            LlmBackend::OpenRouter,
+            "old-key".into(),
+            DEFAULT_OPENROUTER_API_URL.into(),
+            "old".into(),
+        )
+        .unwrap();
         original.save_to_path(&path).unwrap();
-        let replacement =
-            LlmConfig::new("new-key".into(), DEFAULT_API_URL.into(), "new".into()).unwrap();
+        let replacement = LlmConfig::new(
+            LlmBackend::OpenRouter,
+            "new-key".into(),
+            DEFAULT_OPENROUTER_API_URL.into(),
+            "new".into(),
+        )
+        .unwrap();
 
         replacement.save_to_path(&path).unwrap();
 
@@ -805,16 +1041,61 @@ mod tests {
     }
 
     fn spawn_http_server(status: &str, body: String) -> String {
+        spawn_capturing_http_server(status, body).0
+    }
+
+    fn spawn_capturing_http_server(
+        status: &str,
+        body: String,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
+        use std::time::Duration;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let status = status.to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 16 * 1024];
-            let _ = stream.read(&mut request);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4 * 1024];
+            loop {
+                let count = match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(_) => break,
+                };
+                request.extend_from_slice(&chunk[..count]);
+                let request_text = String::from_utf8_lossy(&request);
+                let Some(header_end) = request_text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let content_length = request_text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
             write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -822,14 +1103,14 @@ mod tests {
             )
             .unwrap();
         });
-        format!("http://{address}/api/v1/chat/completions")
+        (format!("http://{address}/v1/chat/completions"), receiver)
     }
 
     #[test]
     fn rejects_an_oversized_api_response() {
         let url = spawn_http_server("200 OK", "x".repeat(MAX_RESPONSE_BYTES + 1));
-        let config = LlmConfig::new_unchecked("key".into(), url, "model".into());
-        let client = build_client().unwrap();
+        let config = LlmConfig::new_unchecked(LlmBackend::Local, "key".into(), url, "model".into());
+        let client = build_local_client().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -852,8 +1133,8 @@ mod tests {
             "429 Too Many Requests",
             r#"{"error":{"message":"rate limited"}}"#.to_string(),
         );
-        let config = LlmConfig::new_unchecked("key".into(), url, "model".into());
-        let client = build_client().unwrap();
+        let config = LlmConfig::new_unchecked(LlmBackend::Local, "key".into(), url, "model".into());
+        let client = build_local_client().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -867,6 +1148,120 @@ mod tests {
             ))
             .unwrap_err();
 
-        assert_eq!(error, "OpenRouter HTTP 429: rate limited");
+        assert_eq!(error, "Local HTTP 429: rate limited");
+    }
+
+    #[test]
+    fn reports_string_and_plain_text_http_api_errors() {
+        let client = build_local_client().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (body, expected) in [
+            (
+                r#"{"error":"model not found"}"#,
+                "Local HTTP 500: model not found",
+            ),
+            (
+                "service unavailable\ntry later",
+                "Local HTTP 500: service unavailable try later",
+            ),
+        ] {
+            let url = spawn_http_server("500 Internal Server Error", body.to_string());
+            let config =
+                LlmConfig::new_unchecked(LlmBackend::Local, String::new(), url, "model".into());
+
+            let error = runtime
+                .block_on(request_move(
+                    &client,
+                    &config,
+                    &[[Cell::Empty; BOARD]; BOARD],
+                    &[(7, 7)],
+                ))
+                .unwrap_err();
+
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn local_request_never_sends_cloud_credentials_or_openrouter_fields() {
+        let body = r#"{
+            "choices":[{"message":{"content":"{\"x\":7,\"y\":7}"}}]
+        }"#
+        .to_string();
+        let (url, captured_request) = spawn_capturing_http_server("200 OK", body);
+        let secret = "must-not-leak-secret";
+        let config =
+            LlmConfig::new_unchecked(LlmBackend::Local, secret.into(), url, "qwen3:4b".into());
+        let client = build_local_client().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let llm_move = runtime
+            .block_on(request_move(
+                &client,
+                &config,
+                &[[Cell::Empty; BOARD]; BOARD],
+                &[(7, 7)],
+            ))
+            .unwrap();
+        let request = captured_request
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let request_lowercase = request.to_ascii_lowercase();
+
+        assert_eq!(llm_move.position, (7, 7));
+        assert_eq!(llm_move.route_label(), "qwen3:4b via Local");
+        assert!(!request.contains(secret));
+        assert!(!request_lowercase.contains("authorization:"));
+        assert!(!request_lowercase.contains("x-openrouter-title:"));
+        assert!(!request.contains("\"reasoning\""));
+        assert!(!request.contains("\"max_completion_tokens\""));
+        assert!(request.contains("\"reasoning_effort\":\"none\""));
+        assert!(request.contains("\"response_format\":{\"type\":\"json_object\"}"));
+    }
+
+    #[test]
+    fn openrouter_request_still_sends_its_credentials_and_headers() {
+        let body = r#"{
+            "model":"openai/gpt-5-mini",
+            "provider":"OpenAI",
+            "choices":[{"message":{"content":"{\"x\":7,\"y\":7}"}}]
+        }"#
+        .to_string();
+        let (url, captured_request) = spawn_capturing_http_server("200 OK", body);
+        let config = LlmConfig::new_unchecked(
+            LlmBackend::OpenRouter,
+            "openrouter-secret".into(),
+            url,
+            DEFAULT_OPENROUTER_MODEL.into(),
+        );
+        let client = build_openrouter_client().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime
+            .block_on(request_move(
+                &client,
+                &config,
+                &[[Cell::Empty; BOARD]; BOARD],
+                &[(7, 7)],
+            ))
+            .unwrap();
+        let request = captured_request
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let request_lowercase = request.to_ascii_lowercase();
+
+        assert!(request_lowercase.contains("authorization: bearer openrouter-secret"));
+        assert!(request_lowercase.contains("x-openrouter-title: wuziqi"));
+        assert!(request.contains("\"reasoning\""));
+        assert!(request.contains("\"max_completion_tokens\":1024"));
     }
 }

@@ -1,6 +1,6 @@
-//! OpenRouter 配置弹窗。配置保存为被 Git 忽略的 JSON 文件。
+//! LLM 配置弹窗。配置保存为被 Git 忽略的 JSON 文件。
 
-use crate::llm_ai::{DEFAULT_API_URL, DEFAULT_MODEL, LlmConfig, config_path};
+use crate::llm_ai::{LlmBackend, LlmConfig, config_path};
 use macroquad::miniquad::window::clipboard_get;
 use macroquad::prelude::*;
 #[cfg(target_os = "macos")]
@@ -25,9 +25,14 @@ pub(crate) enum ConfigAction {
 }
 
 pub(crate) struct LlmConfigPage {
+    backend: LlmBackend,
     api_key: String,
     model: String,
     api_url: String,
+    openrouter_model: String,
+    openrouter_api_url: String,
+    local_model: String,
+    local_api_url: String,
     active: ConfigField,
     reveal_key: bool,
     message: String,
@@ -37,19 +42,39 @@ pub(crate) struct LlmConfigPage {
 
 impl LlmConfigPage {
     pub(crate) fn new(saved: Option<&LlmConfig>, load_error: Option<String>) -> Self {
+        let backend = saved.map_or(LlmBackend::OpenRouter, LlmConfig::backend);
+        let model = saved.map_or_else(
+            || backend.default_model().to_string(),
+            |config| config.model().to_string(),
+        );
+        let api_url = saved.map_or_else(
+            || backend.default_api_url().to_string(),
+            |config| config.api_url().to_string(),
+        );
+        let mut openrouter_model = LlmBackend::OpenRouter.default_model().to_string();
+        let mut openrouter_api_url = LlmBackend::OpenRouter.default_api_url().to_string();
+        let mut local_model = LlmBackend::Local.default_model().to_string();
+        let mut local_api_url = LlmBackend::Local.default_api_url().to_string();
+        match backend {
+            LlmBackend::OpenRouter => {
+                openrouter_model.clone_from(&model);
+                openrouter_api_url.clone_from(&api_url);
+            }
+            LlmBackend::Local => {
+                local_model.clone_from(&model);
+                local_api_url.clone_from(&api_url);
+            }
+        }
         Self {
-            api_key: saved
-                .as_ref()
-                .map_or_else(String::new, |config| config.api_key().to_string()),
-            model: saved.as_ref().map_or_else(
-                || DEFAULT_MODEL.to_string(),
-                |config| config.model().to_string(),
-            ),
-            api_url: saved.as_ref().map_or_else(
-                || DEFAULT_API_URL.to_string(),
-                |config| config.api_url().to_string(),
-            ),
-            active: ConfigField::ApiKey,
+            backend,
+            api_key: saved.map_or_else(String::new, |config| config.api_key().to_string()),
+            model,
+            api_url,
+            openrouter_model,
+            openrouter_api_url,
+            local_model,
+            local_api_url,
+            active: Self::first_field(backend),
             reveal_key: false,
             message: String::new(),
             load_error,
@@ -58,9 +83,52 @@ impl LlmConfigPage {
     }
 
     pub(crate) fn open(&mut self) {
-        self.active = ConfigField::ApiKey;
+        self.active = Self::first_field(self.backend);
         self.reveal_key = false;
         self.message = self.load_error.clone().unwrap_or_default();
+    }
+
+    fn first_field(backend: LlmBackend) -> ConfigField {
+        if backend.requires_api_key() {
+            ConfigField::ApiKey
+        } else {
+            ConfigField::Model
+        }
+    }
+
+    fn shows_api_key(&self) -> bool {
+        self.backend.requires_api_key()
+    }
+
+    fn select_backend(&mut self, backend: LlmBackend) {
+        if self.backend == backend {
+            return;
+        }
+
+        match self.backend {
+            LlmBackend::OpenRouter => {
+                self.openrouter_model.clone_from(&self.model);
+                self.openrouter_api_url.clone_from(&self.api_url);
+            }
+            LlmBackend::Local => {
+                self.local_model.clone_from(&self.model);
+                self.local_api_url.clone_from(&self.api_url);
+            }
+        }
+        self.backend = backend;
+        match backend {
+            LlmBackend::OpenRouter => {
+                self.model.clone_from(&self.openrouter_model);
+                self.api_url.clone_from(&self.openrouter_api_url);
+            }
+            LlmBackend::Local => {
+                self.model.clone_from(&self.local_model);
+                self.api_url.clone_from(&self.local_api_url);
+            }
+        }
+        self.active = Self::first_field(backend);
+        self.reveal_key = false;
+        self.message.clear();
     }
 
     fn active_value_mut(&mut self) -> &mut String {
@@ -72,10 +140,12 @@ impl LlmConfigPage {
     }
 
     fn next_field(&mut self) {
-        self.active = match self.active {
-            ConfigField::ApiKey => ConfigField::Model,
-            ConfigField::Model => ConfigField::ApiUrl,
-            ConfigField::ApiUrl => ConfigField::ApiKey,
+        self.active = match (self.backend.requires_api_key(), self.active) {
+            (true, ConfigField::ApiKey) => ConfigField::Model,
+            (true, ConfigField::Model) => ConfigField::ApiUrl,
+            (true, ConfigField::ApiUrl) => ConfigField::ApiKey,
+            (false, ConfigField::ApiKey | ConfigField::ApiUrl) => ConfigField::Model,
+            (false, ConfigField::Model) => ConfigField::ApiUrl,
         };
     }
 
@@ -156,7 +226,23 @@ impl LlmConfigPage {
             Color::from_rgba(100, 135, 180, 255),
         );
 
-        draw_text("OpenRouter Configuration", 100.0, 150.0, 28.0, WHITE);
+        draw_text("LLM Configuration", 100.0, 150.0, 28.0, WHITE);
+        let openrouter_backend_rect = Rect::new(350.0, 122.0, 110.0, 34.0);
+        let local_backend_rect = Rect::new(468.0, 122.0, 72.0, 34.0);
+        if draw_choice_button(
+            openrouter_backend_rect,
+            "OpenRouter",
+            self.backend == LlmBackend::OpenRouter,
+        ) {
+            self.select_backend(LlmBackend::OpenRouter);
+        }
+        if draw_choice_button(
+            local_backend_rect,
+            "Local",
+            self.backend == LlmBackend::Local,
+        ) {
+            self.select_backend(LlmBackend::Local);
+        }
         let storage_note = config_path().map_or_else(
             |error| format!("Configuration path unavailable: {error}"),
             |path| format!("Saved to {}", path.display()),
@@ -176,13 +262,6 @@ impl LlmConfigPage {
         let model_rect = Rect::new(100.0, 305.0, 440.0, 38.0);
         let url_rect = Rect::new(100.0, 390.0, 440.0, 38.0);
         draw_text(
-            "OpenRouter API Key",
-            100.0,
-            212.0,
-            18.0,
-            Color::from_rgba(220, 225, 235, 255),
-        );
-        draw_text(
             "Model",
             100.0,
             297.0,
@@ -197,18 +276,42 @@ impl LlmConfigPage {
             Color::from_rgba(220, 225, 235, 255),
         );
 
-        let key_display = if self.reveal_key {
-            self.api_key.clone()
+        if self.shows_api_key() {
+            draw_text(
+                "OpenRouter API Key",
+                100.0,
+                212.0,
+                18.0,
+                Color::from_rgba(220, 225, 235, 255),
+            );
+            let key_display = if self.reveal_key {
+                self.api_key.clone()
+            } else {
+                "*".repeat(self.api_key.chars().count())
+            };
+            draw_field(key_rect, &key_display, self.active == ConfigField::ApiKey);
         } else {
-            "*".repeat(self.api_key.chars().count())
-        };
-        draw_field(key_rect, &key_display, self.active == ConfigField::ApiKey);
+            draw_text(
+                "Local OpenAI-compatible server",
+                100.0,
+                225.0,
+                18.0,
+                Color::from_rgba(205, 220, 235, 255),
+            );
+            draw_text(
+                "No key is sent; only 127.0.0.1 or ::1 is allowed.",
+                100.0,
+                250.0,
+                15.0,
+                Color::from_rgba(155, 190, 170, 255),
+            );
+        }
         draw_field(model_rect, &self.model, self.active == ConfigField::Model);
         draw_field(url_rect, &self.api_url, self.active == ConfigField::ApiUrl);
 
         let (mx, my) = mouse_position();
         let clicked = is_mouse_button_pressed(MouseButton::Left);
-        if clicked && key_rect.contains(vec2(mx, my)) {
+        if self.shows_api_key() && clicked && key_rect.contains(vec2(mx, my)) {
             self.active = ConfigField::ApiKey;
         }
         if clicked && model_rect.contains(vec2(mx, my)) {
@@ -217,16 +320,23 @@ impl LlmConfigPage {
         if clicked && url_rect.contains(vec2(mx, my)) {
             self.active = ConfigField::ApiUrl;
         }
-        if draw_button(paste_rect, "Paste") {
-            self.active = ConfigField::ApiKey;
-            self.paste_active();
-        }
-        if draw_button(show_rect, if self.reveal_key { "Hide" } else { "Show" }) {
-            self.reveal_key = !self.reveal_key;
+        if self.shows_api_key() {
+            if draw_button(paste_rect, "Paste") {
+                self.active = ConfigField::ApiKey;
+                self.paste_active();
+            }
+            if draw_button(show_rect, if self.reveal_key { "Hide" } else { "Show" }) {
+                self.reveal_key = !self.reveal_key;
+            }
         }
 
+        let help = if self.shows_api_key() {
+            "Use Paste or Cmd/Ctrl+V. The key is never shown in logs."
+        } else {
+            "Ollama preset; also works with LM Studio and llama.cpp."
+        };
         draw_text(
-            "Use Paste or Cmd/Ctrl+V. The key is never shown in logs.",
+            help,
             100.0,
             458.0,
             15.0,
@@ -251,6 +361,7 @@ impl LlmConfigPage {
         }
         if save || is_key_pressed(KeyCode::Enter) {
             match LlmConfig::new(
+                self.backend,
                 self.api_key.clone(),
                 self.api_url.clone(),
                 self.model.clone(),
@@ -372,6 +483,40 @@ fn draw_button(rect: Rect, label: &str) -> bool {
     hover && is_mouse_button_pressed(MouseButton::Left)
 }
 
+fn draw_choice_button(rect: Rect, label: &str, selected: bool) -> bool {
+    let (mx, my) = mouse_position();
+    let hover = rect.contains(vec2(mx, my));
+    let color = if selected {
+        Color::from_rgba(70, 135, 195, 255)
+    } else if hover {
+        Color::from_rgba(75, 95, 125, 255)
+    } else {
+        Color::from_rgba(55, 65, 82, 255)
+    };
+    draw_rectangle(rect.x, rect.y, rect.w, rect.h, color);
+    draw_rectangle_lines(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        if selected { 2.0 } else { 1.0 },
+        if selected {
+            Color::from_rgba(140, 195, 245, 255)
+        } else {
+            Color::from_rgba(90, 105, 125, 255)
+        },
+    );
+    let size = measure_text(label, None, 16, 1.0);
+    draw_text(
+        label,
+        rect.x + (rect.w - size.width) / 2.0,
+        rect.y + (rect.h + size.height) / 2.0 - 2.0,
+        16.0,
+        WHITE,
+    );
+    hover && is_mouse_button_pressed(MouseButton::Left)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +551,46 @@ mod tests {
         page.open();
 
         assert_eq!(page.message, "Invalid configuration");
+    }
+
+    #[test]
+    fn selecting_local_applies_ollama_defaults_and_skips_api_key() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.api_key = "keep-for-openrouter".to_string();
+
+        page.select_backend(LlmBackend::Local);
+
+        assert_eq!(page.backend, LlmBackend::Local);
+        assert_eq!(page.model, LlmBackend::Local.default_model());
+        assert_eq!(page.api_url, LlmBackend::Local.default_api_url());
+        assert_eq!(page.api_key, "keep-for-openrouter");
+        assert_eq!(page.active, ConfigField::Model);
+        assert!(!page.shows_api_key());
+
+        page.next_field();
+        assert_eq!(page.active, ConfigField::ApiUrl);
+        page.next_field();
+        assert_eq!(page.active, ConfigField::Model);
+    }
+
+    #[test]
+    fn switching_backends_preserves_each_backend_draft() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.model = "custom-router-model".to_string();
+        page.select_backend(LlmBackend::Local);
+        page.model = "custom-local".to_string();
+        page.api_url = "http://127.0.0.1:1234/v1/chat/completions".to_string();
+
+        page.select_backend(LlmBackend::OpenRouter);
+
+        assert_eq!(page.backend, LlmBackend::OpenRouter);
+        assert_eq!(page.model, "custom-router-model");
+        assert_eq!(page.api_url, LlmBackend::OpenRouter.default_api_url());
+        assert_eq!(page.active, ConfigField::ApiKey);
+        assert!(page.shows_api_key());
+
+        page.select_backend(LlmBackend::Local);
+        assert_eq!(page.model, "custom-local");
+        assert_eq!(page.api_url, "http://127.0.0.1:1234/v1/chat/completions");
     }
 }
