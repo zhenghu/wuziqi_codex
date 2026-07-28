@@ -4,7 +4,10 @@ use crate::ai::{ai_move, llm_candidate_moves};
 use crate::board_view::{self, Button, TOP_BAR, WIN_H, WIN_W};
 use crate::config_ui::{ConfigAction, LlmConfigPage};
 use crate::game::{Cell, Game, Mode, Status};
-use crate::llm_ai::{LlmConfig, LlmMove, build_client, config_exists, request_move};
+use crate::llm_ai::{
+    LlmBackend, LlmConfig, LlmMove, build_local_client, build_openrouter_client, config_exists,
+    request_move,
+};
 use macroquad::prelude::*;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -37,7 +40,8 @@ struct LlmWorker {
 
 impl LlmWorker {
     fn new() -> Result<Self, String> {
-        let client = build_client()?;
+        let cloud_client = build_openrouter_client()?;
+        let local_client = build_local_client()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -63,7 +67,10 @@ impl LlmWorker {
                                 candidates,
                                 result,
                             } => {
-                                let client = client.clone();
+                                let client = match config.backend() {
+                                    LlmBackend::OpenRouter => cloud_client.clone(),
+                                    LlmBackend::Local => local_client.clone(),
+                                };
                                 active = Some(tokio::spawn(async move {
                                     let response =
                                         request_move(&client, &config, &board, &candidates).await;
@@ -114,7 +121,7 @@ pub(crate) struct App {
     ai_notice: String,
     config_page: LlmConfigPage,
     active_llm_config: Option<LlmConfig>,
-    openrouter_status: String,
+    llm_status: String,
     show_config: bool,
     llm_attempt: u8,
 }
@@ -126,7 +133,7 @@ impl App {
             Ok(config) => (Some(config), None),
             Err(error) => {
                 if had_config {
-                    eprintln!("OpenRouter 配置加载失败: {error}");
+                    eprintln!("大模型配置加载失败: {error}");
                     (None, Some(format!("Configuration load failed: {error}")))
                 } else {
                     (None, None)
@@ -138,11 +145,10 @@ impl App {
         } else {
             AiAlgorithm::TacticalSearch
         };
-        let openrouter_status = if active_llm_config.is_some() {
-            "OpenRouter: not connected"
-        } else {
-            "OpenRouter: not configured"
-        };
+        let llm_status = active_llm_config
+            .as_ref()
+            .map(|config| format!("{}: not connected", config.backend().label()))
+            .unwrap_or_else(|| "LLM: not configured".to_string());
         let llm_worker = match LlmWorker::new() {
             Ok(worker) => Some(worker),
             Err(error) => {
@@ -159,7 +165,7 @@ impl App {
             ai_notice: String::new(),
             config_page: LlmConfigPage::new(active_llm_config.as_ref(), config_load_error),
             active_llm_config,
-            openrouter_status: openrouter_status.to_string(),
+            llm_status,
             show_config: false,
             llm_attempt: 0,
         }
@@ -273,7 +279,7 @@ impl App {
     fn ai_model_label(&self) -> String {
         match self.ai_algorithm {
             AiAlgorithm::TacticalSearch => "Tactical Search".to_string(),
-            AiAlgorithm::LargeModel => compact_text(&self.openrouter_status, 38),
+            AiAlgorithm::LargeModel => compact_text(&self.llm_status, 38),
         }
     }
 
@@ -297,7 +303,7 @@ impl App {
             30.0,
             match self.ai_algorithm {
                 AiAlgorithm::TacticalSearch => "AI: Tactical",
-                AiAlgorithm::LargeModel => "AI: Router",
+                AiAlgorithm::LargeModel => "AI: LLM",
             },
         );
         let config = Button::new(540.0, 12.0, 83.0, 30.0, "Config (C)");
@@ -372,11 +378,12 @@ impl App {
             ConfigAction::None => {}
             ConfigAction::Cancel => self.show_config = false,
             ConfigAction::Save(config) => {
+                let backend = config.backend().label();
+                self.llm_status = format!("{backend}: not connected");
                 self.active_llm_config = Some(config);
-                self.openrouter_status = "OpenRouter: not connected".to_string();
                 self.ai_algorithm = AiAlgorithm::LargeModel;
                 self.cancel_ai();
-                self.ai_notice = "OpenRouter config saved".to_string();
+                self.ai_notice = format!("{backend} config saved");
                 self.show_config = false;
             }
         }
@@ -417,12 +424,13 @@ impl App {
             return;
         };
         let model = config.model().to_string();
-        self.openrouter_status = match previous_error {
+        let backend = config.backend().label();
+        self.llm_status = match previous_error {
             Some(error) => {
                 let reason = llm_failure_summary(error, 28);
                 format!("Retry {}/{}: {reason}", self.llm_attempt, MAX_LLM_ATTEMPTS)
             }
-            None => "OpenRouter: connecting...".to_string(),
+            None => format!("{backend}: connecting..."),
         };
         let Some(worker) = &self.llm_worker else {
             self.fallback_to_tactical("LLM worker unavailable; used fallback");
@@ -446,7 +454,7 @@ impl App {
         };
         match pending.result.try_recv() {
             Ok(Ok(llm_move)) => {
-                self.openrouter_status = llm_move.route_label();
+                self.llm_status = llm_move.route_label();
                 self.game.place(llm_move.position.0, llm_move.position.1);
                 self.ai_thinking = false;
                 self.pending_llm = None;
@@ -463,14 +471,19 @@ impl App {
                     self.start_llm_request(Some(&error));
                 } else {
                     let reason = llm_failure_summary(&error, 30);
-                    self.openrouter_status = format!("Failed: {reason}");
+                    self.llm_status = format!("Failed: {reason}");
                     eprintln!("大模型连续 {MAX_LLM_ATTEMPTS} 次失败，使用战术搜索: {error}");
                     self.fallback_to_tactical(&format!("LLM failed: {reason}; fallback"));
                 }
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
-                self.openrouter_status = "OpenRouter: call stopped".to_string();
+                let backend = self
+                    .active_llm_config
+                    .as_ref()
+                    .map(|config| config.backend().label())
+                    .unwrap_or("LLM");
+                self.llm_status = format!("{backend}: call stopped");
                 self.fallback_to_tactical("LLM stopped; used fallback");
             }
         }
@@ -554,8 +567,9 @@ mod worker_tests {
             std::thread::sleep(Duration::from_secs(2));
         });
         let config = LlmConfig::new_unchecked(
+            LlmBackend::Local,
             "key".into(),
-            format!("http://{address}/api/v1/chat/completions"),
+            format!("http://{address}/v1/chat/completions"),
             "model".into(),
         );
         let worker = LlmWorker::new().unwrap();
