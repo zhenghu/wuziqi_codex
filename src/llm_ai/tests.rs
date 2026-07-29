@@ -163,6 +163,14 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 }
 
 fn run_request(config: &LlmConfig, candidates: &[(usize, usize)]) -> Result<LlmMove, String> {
+    run_request_for_side(config, Cell::White, candidates)
+}
+
+fn run_request_for_side(
+    config: &LlmConfig,
+    side: Cell,
+    candidates: &[(usize, usize)],
+) -> Result<LlmMove, String> {
     let client = match config.backend() {
         LlmBackend::OpenRouter => build_openrouter_client(),
         LlmBackend::Local => build_local_client(),
@@ -176,6 +184,7 @@ fn run_request(config: &LlmConfig, candidates: &[(usize, usize)]) -> Result<LlmM
             &client,
             config,
             &[[Cell::Empty; BOARD]; BOARD],
+            side,
             candidates,
         ))
 }
@@ -229,6 +238,50 @@ fn labels_the_route_reported_by_openrouter() {
 }
 
 #[test]
+fn black_request_identifies_black_as_x_and_white_as_o() {
+    let server = TestServer::new(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"{\"x\":7,\"y\":7}"}}]}"#,
+    );
+    let config = local_test_config(&server);
+
+    let llm_move = run_request_for_side(&config, Cell::Black, &[(7, 7)]).unwrap();
+    let request = server.finish();
+
+    assert_eq!(llm_move.position, (7, 7));
+    assert!(request.contains("你执黑棋 X，对手执白棋 O，当前轮到你落子"));
+}
+
+#[test]
+fn white_request_identifies_white_as_o_and_black_as_x() {
+    let server = TestServer::new(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"{\"x\":7,\"y\":7}"}}]}"#,
+    );
+    let config = local_test_config(&server);
+
+    let llm_move = run_request_for_side(&config, Cell::White, &[(7, 7)]).unwrap();
+    let request = server.finish();
+
+    assert_eq!(llm_move.position, (7, 7));
+    assert!(request.contains("你执白棋 O，对手执黑棋 X，当前轮到你落子"));
+}
+
+#[test]
+fn request_rejects_an_empty_side_before_network_io() {
+    let config = LlmConfig::new_unchecked(
+        LlmBackend::Local,
+        String::new(),
+        "http://127.0.0.1:1/v1/chat/completions".to_string(),
+        "model".to_string(),
+    );
+
+    let error = run_request_for_side(&config, Cell::Empty, &[(7, 7)]).unwrap_err();
+
+    assert_eq!(error, "大模型执子方不能是空棋子");
+}
+
+#[test]
 fn legacy_json_configuration_defaults_to_openrouter() {
     let raw = r#"{
         "api_key": "sk-or-test",
@@ -242,6 +295,81 @@ fn legacy_json_configuration_defaults_to_openrouter() {
     assert_eq!(config.api_key(), "sk-or-test");
     assert_eq!(config.api_url(), DEFAULT_OPENROUTER_API_URL);
     assert_eq!(config.model(), DEFAULT_OPENROUTER_MODEL);
+}
+
+#[test]
+fn settings_support_two_named_profiles_and_an_active_profile() {
+    let cloud = LlmProfile::new(
+        "Cloud",
+        LlmConfig::new(
+            LlmBackend::OpenRouter,
+            "cloud-key".into(),
+            DEFAULT_OPENROUTER_API_URL.into(),
+            "cloud-model".into(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let local = LlmProfile::new(
+        "Local",
+        LlmConfig::new(
+            LlmBackend::Local,
+            "must-not-be-retained".into(),
+            DEFAULT_LOCAL_API_URL.into(),
+            "local-model".into(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let settings = LlmSettings::new(vec![cloud, local], 1).unwrap();
+    let (black, white) = settings.arena_pair().unwrap();
+
+    assert_eq!(settings.profiles().len(), 2);
+    assert_eq!(settings.active_profile_index(), 1);
+    assert_eq!(settings.active_profile().name(), "Local");
+    assert_eq!(black.name(), "Cloud");
+    assert_eq!(white.name(), "Local");
+    assert_eq!(black.config().api_key(), "cloud-key");
+    assert!(white.config().api_key().is_empty());
+}
+
+#[test]
+fn settings_validate_profile_count_names_and_active_index() {
+    let config = || {
+        LlmConfig::new(
+            LlmBackend::Local,
+            String::new(),
+            DEFAULT_LOCAL_API_URL.into(),
+            DEFAULT_LOCAL_MODEL.into(),
+        )
+        .unwrap()
+    };
+
+    assert!(LlmSettings::new(Vec::new(), 0).is_err());
+    assert!(
+        LlmSettings::new(
+            vec![
+                LlmProfile::new("one", config()).unwrap(),
+                LlmProfile::new("two", config()).unwrap(),
+                LlmProfile::new("three", config()).unwrap(),
+            ],
+            0,
+        )
+        .is_err()
+    );
+    assert!(LlmSettings::new(vec![LlmProfile::new("one", config()).unwrap()], 1).is_err());
+    assert!(LlmProfile::new("   ", config()).is_err());
+    assert!(
+        LlmSettings::new(
+            vec![
+                LlmProfile::new("same", config()).unwrap(),
+                LlmProfile::new("same", config()).unwrap(),
+            ],
+            0,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -379,10 +507,15 @@ fn migrates_legacy_configuration_to_the_system_path() {
     #[cfg(unix)]
     std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o400)).unwrap();
 
-    let loaded = LlmConfig::load_with_paths(&current, &legacy).unwrap();
+    let loaded = LlmSettings::load_with_paths(&current, &legacy).unwrap();
+    let config = loaded.active_profile().config();
 
-    assert_eq!(loaded.api_key(), legacy_key.trim_end_matches('v'));
-    assert_eq!(loaded.backend(), LlmBackend::OpenRouter);
+    assert_eq!(loaded.profiles().len(), 1);
+    assert!(loaded.arena_pair().is_none());
+    assert_eq!(loaded.active_profile_index(), 0);
+    assert_eq!(loaded.active_profile().name(), "model");
+    assert_eq!(config.api_key(), legacy_key.trim_end_matches('v'));
+    assert_eq!(config.backend(), LlmBackend::OpenRouter);
     assert!(current.exists());
     assert!(!legacy.exists());
     assert!(migrated_legacy_config_path(&legacy).exists());
@@ -395,12 +528,14 @@ fn migrates_legacy_configuration_to_the_system_path() {
             & 0o777,
         0o600
     );
-    let (migrated, repaired) = LlmConfig::read_from_path(&current).unwrap();
-    assert_eq!(migrated.model(), "model");
+    let (migrated, repaired) = LlmSettings::read_from_path(&current).unwrap();
+    assert_eq!(migrated.active_profile().config().model(), "model");
     assert!(!repaired);
     let migrated_json: Value =
         serde_json::from_str(&std::fs::read_to_string(&current).unwrap()).unwrap();
-    assert_eq!(migrated_json["backend"], "openrouter");
+    assert_eq!(migrated_json["schema_version"], SETTINGS_SCHEMA_VERSION);
+    assert_eq!(migrated_json["profiles"].as_array().unwrap().len(), 1);
+    assert_eq!(migrated_json["profiles"][0]["backend"], "openrouter");
 }
 
 #[test]
@@ -414,13 +549,167 @@ fn upgrades_a_current_three_field_configuration_in_place() {
     )
     .unwrap();
 
-    let loaded = LlmConfig::load_with_paths(&current, &missing_legacy).unwrap();
+    let loaded = LlmSettings::load_with_paths(&current, &missing_legacy).unwrap();
 
-    assert_eq!(loaded.backend(), LlmBackend::OpenRouter);
+    assert_eq!(
+        loaded.active_profile().config().backend(),
+        LlmBackend::OpenRouter
+    );
+    assert_eq!(loaded.profiles().len(), 1);
     let upgraded: Value =
         serde_json::from_str(&std::fs::read_to_string(&current).unwrap()).unwrap();
-    assert_eq!(upgraded["backend"], "openrouter");
+    assert_eq!(upgraded["schema_version"], SETTINGS_SCHEMA_VERSION);
+    assert_eq!(upgraded["profiles"][0]["backend"], "openrouter");
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn two_profile_settings_round_trip_in_one_versioned_file() {
+    let root = TestDir::new("two-profile-round-trip");
+    let path = root.join(CONFIG_FILE_NAME);
+    let settings = LlmSettings::new(
+        vec![
+            LlmProfile::new(
+                "Cloud",
+                LlmConfig::new(
+                    LlmBackend::OpenRouter,
+                    "cloud-key".into(),
+                    DEFAULT_OPENROUTER_API_URL.into(),
+                    "cloud-model".into(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            LlmProfile::new(
+                "Local",
+                LlmConfig::new(
+                    LlmBackend::Local,
+                    String::new(),
+                    DEFAULT_LOCAL_API_URL.into(),
+                    "local-model".into(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ],
+        1,
+    )
+    .unwrap();
+
+    settings.save_to_path(&path).unwrap();
+    let (loaded, changed) = LlmSettings::read_from_path(&path).unwrap();
+
+    assert!(!changed);
+    assert_eq!(loaded.active_profile_index(), 1);
+    let (black, white) = loaded.arena_pair().unwrap();
+    assert_eq!(black.name(), "Cloud");
+    assert_eq!(black.config().model(), "cloud-model");
+    assert_eq!(black.config().api_key(), "cloud-key");
+    assert_eq!(white.name(), "Local");
+    assert_eq!(white.config().model(), "local-model");
+    assert!(white.config().api_key().is_empty());
+    let json: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(json["schema_version"], SETTINGS_SCHEMA_VERSION);
+    assert_eq!(json["profiles"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn missing_active_profile_is_defaulted_and_rewritten() {
+    let root = TestDir::new("missing-active-profile");
+    let current = root.join(CONFIG_FILE_NAME);
+    let missing_legacy = root.join("missing").join(CONFIG_FILE_NAME);
+    std::fs::write(
+        &current,
+        format!(
+            r#"{{
+                "schema_version":2,
+                "profiles":[{{
+                    "name":"Local",
+                    "backend":"local",
+                    "api_url":"{DEFAULT_LOCAL_API_URL}",
+                    "model":"local-model"
+                }}]
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let loaded = LlmSettings::load_with_paths(&current, &missing_legacy).unwrap();
+
+    assert_eq!(loaded.active_profile_index(), 0);
+    let rewritten: Value =
+        serde_json::from_str(&std::fs::read_to_string(&current).unwrap()).unwrap();
+    assert_eq!(rewritten["active_profile"], 0);
+}
+
+#[test]
+fn loading_versioned_settings_scrubs_a_cloud_key_from_a_local_profile() {
+    let root = TestDir::new("versioned-local-key-cleanup");
+    let current = root.join(CONFIG_FILE_NAME);
+    let missing_legacy = root.join("missing").join(CONFIG_FILE_NAME);
+    std::fs::write(
+        &current,
+        format!(
+            r#"{{
+                "schema_version":2,
+                "profiles":[
+                    {{
+                        "name":"Cloud",
+                        "backend":"openrouter",
+                        "api_key":"cloud-key",
+                        "api_url":"{DEFAULT_OPENROUTER_API_URL}",
+                        "model":"cloud-model"
+                    }},
+                    {{
+                        "name":"Local",
+                        "backend":"local",
+                        "api_key":"must-be-removed",
+                        "api_url":"{DEFAULT_LOCAL_API_URL}",
+                        "model":"local-model"
+                    }}
+                ],
+                "active_profile":0
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let loaded = LlmSettings::load_with_paths(&current, &missing_legacy).unwrap();
+    let (cloud, local) = loaded.arena_pair().unwrap();
+
+    assert_eq!(cloud.config().api_key(), "cloud-key");
+    assert!(local.config().api_key().is_empty());
+    let rewritten = std::fs::read_to_string(&current).unwrap();
+    assert!(rewritten.contains("cloud-key"));
+    assert!(!rewritten.contains("must-be-removed"));
+}
+
+#[test]
+fn rejects_a_future_schema_without_rewriting_the_file() {
+    let root = TestDir::new("future-schema");
+    let current = root.join(CONFIG_FILE_NAME);
+    let missing_legacy = root.join("missing").join(CONFIG_FILE_NAME);
+    let original = format!(
+        r#"{{
+            "schema_version":{},
+            "profiles":[],
+            "active_profile":0
+        }}"#,
+        SETTINGS_SCHEMA_VERSION + 1
+    );
+    std::fs::write(&current, &original).unwrap();
+
+    let error = match LlmSettings::load_with_paths(&current, &missing_legacy) {
+        Ok(_) => panic!("a future schema must not load"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("Unsupported future LLM configuration schema version")
+    );
+    assert_eq!(std::fs::read_to_string(&current).unwrap(), original);
 }
 
 #[test]
@@ -435,16 +724,19 @@ fn local_configuration_round_trips_without_an_api_key() {
     )
     .unwrap();
 
-    config.save_to_path(&path).unwrap();
+    let profile = LlmProfile::new("Local", config).unwrap();
+    let settings = LlmSettings::new(vec![profile], 0).unwrap();
+    settings.save_to_path(&path).unwrap();
 
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(!text.contains("must-be-cleared"));
     assert!(!text.contains("api_key"));
-    let (loaded, changed) = LlmConfig::read_from_path(&path).unwrap();
-    assert_eq!(loaded.backend(), LlmBackend::Local);
-    assert_eq!(loaded.api_url(), DEFAULT_LOCAL_API_URL);
-    assert_eq!(loaded.model(), DEFAULT_LOCAL_MODEL);
-    assert!(loaded.api_key().is_empty());
+    let (loaded, changed) = LlmSettings::read_from_path(&path).unwrap();
+    let config = loaded.active_profile().config();
+    assert_eq!(config.backend(), LlmBackend::Local);
+    assert_eq!(config.api_url(), DEFAULT_LOCAL_API_URL);
+    assert_eq!(config.model(), DEFAULT_LOCAL_MODEL);
+    assert!(config.api_key().is_empty());
     assert!(!changed);
 }
 
@@ -461,9 +753,9 @@ fn loading_local_configuration_removes_a_stored_cloud_key() {
     )
     .unwrap();
 
-    let loaded = LlmConfig::load_with_paths(&current, &missing_legacy).unwrap();
+    let loaded = LlmSettings::load_with_paths(&current, &missing_legacy).unwrap();
 
-    assert!(loaded.api_key().is_empty());
+    assert!(loaded.active_profile().config().api_key().is_empty());
     let rewritten = std::fs::read_to_string(&current).unwrap();
     assert!(!rewritten.contains("cloud-secret"));
     assert!(!rewritten.contains("api_key"));
@@ -473,27 +765,47 @@ fn loading_local_configuration_removes_a_stored_cloud_key() {
 fn atomically_replaces_an_existing_configuration() {
     let root = TestDir::new("atomic-save");
     let path = root.join(CONFIG_FILE_NAME);
-    let original = LlmConfig::new(
-        LlmBackend::OpenRouter,
-        "old-key".into(),
-        DEFAULT_OPENROUTER_API_URL.into(),
-        "old".into(),
+    let original = LlmSettings::new(
+        vec![
+            LlmProfile::new(
+                "Old",
+                LlmConfig::new(
+                    LlmBackend::OpenRouter,
+                    "old-key".into(),
+                    DEFAULT_OPENROUTER_API_URL.into(),
+                    "old".into(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ],
+        0,
     )
     .unwrap();
     original.save_to_path(&path).unwrap();
-    let replacement = LlmConfig::new(
-        LlmBackend::OpenRouter,
-        "new-key".into(),
-        DEFAULT_OPENROUTER_API_URL.into(),
-        "new".into(),
+    let replacement = LlmSettings::new(
+        vec![
+            LlmProfile::new(
+                "New",
+                LlmConfig::new(
+                    LlmBackend::OpenRouter,
+                    "new-key".into(),
+                    DEFAULT_OPENROUTER_API_URL.into(),
+                    "new".into(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ],
+        0,
     )
     .unwrap();
 
     replacement.save_to_path(&path).unwrap();
 
-    let (loaded, repaired) = LlmConfig::read_from_path(&path).unwrap();
-    assert_eq!(loaded.api_key(), "new-key");
-    assert_eq!(loaded.model(), "new");
+    let (loaded, repaired) = LlmSettings::read_from_path(&path).unwrap();
+    assert_eq!(loaded.active_profile().config().api_key(), "new-key");
+    assert_eq!(loaded.active_profile().config().model(), "new");
     assert!(!repaired);
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
@@ -505,15 +817,25 @@ fn failed_replacement_preserves_the_destination_and_cleans_up_the_temporary_file
     std::fs::create_dir(&destination).unwrap();
     let marker = destination.join("keep");
     std::fs::write(&marker, "original destination").unwrap();
-    let config = LlmConfig::new(
-        LlmBackend::Local,
-        String::new(),
-        DEFAULT_LOCAL_API_URL.into(),
-        DEFAULT_LOCAL_MODEL.into(),
+    let settings = LlmSettings::new(
+        vec![
+            LlmProfile::new(
+                "Local",
+                LlmConfig::new(
+                    LlmBackend::Local,
+                    String::new(),
+                    DEFAULT_LOCAL_API_URL.into(),
+                    DEFAULT_LOCAL_MODEL.into(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ],
+        0,
     )
     .unwrap();
 
-    let error = config.save_to_path(&destination).unwrap_err();
+    let error = settings.save_to_path(&destination).unwrap_err();
 
     assert!(error.to_string().contains("replace"));
     assert!(destination.is_dir());

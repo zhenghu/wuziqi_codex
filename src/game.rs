@@ -15,6 +15,19 @@ pub(crate) enum Cell {
 pub(crate) enum Mode {
     HumanVsAi,
     HumanVsHuman,
+    /// 黑白双方都由大模型驱动；落子合法性仍由 `Game` 统一裁决。
+    LlmVsLlm,
+}
+
+impl Mode {
+    /// 按应用界面的固定顺序切换游戏模式。
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::HumanVsAi => Self::HumanVsHuman,
+            Self::HumanVsHuman => Self::LlmVsLlm,
+            Self::LlmVsLlm => Self::HumanVsAi,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

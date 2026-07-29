@@ -9,6 +9,13 @@ fn opponent_swaps_colors_and_keeps_empty() {
 }
 
 #[test]
+fn mode_cycles_through_human_and_llm_matchups() {
+    assert_eq!(Mode::HumanVsAi.next(), Mode::HumanVsHuman);
+    assert_eq!(Mode::HumanVsHuman.next(), Mode::LlmVsLlm);
+    assert_eq!(Mode::LlmVsLlm.next(), Mode::HumanVsAi);
+}
+
+#[test]
 fn winning_line_detects_all_four_axes() {
     for (dx, dy) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
         let mut board = empty_board();
@@ -45,6 +52,28 @@ fn place_updates_state_and_rejects_an_occupied_cell() {
     assert!(!game.place(7, 7));
     assert_eq!(game.history, vec![(7, 7)]);
     assert_eq!(game.turn, Cell::White);
+}
+
+#[test]
+fn llm_vs_llm_uses_the_standard_placement_and_win_rules() {
+    let mut game = Game::new(Mode::LlmVsLlm);
+    assert_eq!(game.turn, Cell::Black);
+    assert!(game.place(3, 7));
+    assert_eq!(game.board[7][3], Cell::Black);
+    assert_eq!(game.turn, Cell::White);
+    assert!(!game.place(3, 7));
+    assert!(game.place(3, 8));
+
+    for x in 4..7 {
+        assert!(game.place(x, 7));
+        assert!(game.place(x, 8));
+    }
+    assert!(game.place(7, 7));
+
+    assert_eq!(game.status, Status::Won(Cell::Black));
+    assert_eq!(game.win_line.len(), 5);
+    assert_eq!(game.mode, Mode::LlmVsLlm);
+    assert!(!game.place(8, 8));
 }
 
 #[test]
