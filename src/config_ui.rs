@@ -1,6 +1,6 @@
 //! LLM 配置弹窗。配置保存为被 Git 忽略的 JSON 文件。
 
-use crate::llm_ai::{LlmBackend, LlmConfig, config_path};
+use crate::llm_ai::{LlmBackend, LlmConfig, LlmProfile, LlmSettings, config_path};
 use macroquad::miniquad::window::clipboard_get;
 use macroquad::prelude::*;
 #[cfg(target_os = "macos")]
@@ -18,13 +18,29 @@ enum ConfigField {
     ApiUrl,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileSlot {
+    Black,
+    White,
+}
+
+impl ProfileSlot {
+    fn index(self) -> usize {
+        match self {
+            Self::Black => 0,
+            Self::White => 1,
+        }
+    }
+}
+
 pub(crate) enum ConfigAction {
     None,
     Cancel,
-    Save(LlmConfig),
+    Save(LlmSettings),
 }
 
-pub(crate) struct LlmConfigPage {
+struct ProfileDraft {
+    name: String,
     backend: LlmBackend,
     api_key: String,
     model: String,
@@ -33,21 +49,17 @@ pub(crate) struct LlmConfigPage {
     openrouter_api_url: String,
     local_model: String,
     local_api_url: String,
-    active: ConfigField,
-    reveal_key: bool,
-    message: String,
-    load_error: Option<String>,
-    suppress_paste_chars: bool,
 }
 
-impl LlmConfigPage {
-    pub(crate) fn new(saved: Option<&LlmConfig>, load_error: Option<String>) -> Self {
-        let backend = saved.map_or(LlmBackend::OpenRouter, LlmConfig::backend);
-        let model = saved.map_or_else(
+impl ProfileDraft {
+    fn new(saved: Option<&LlmProfile>, default_name: &str) -> Self {
+        let config = saved.map(LlmProfile::config);
+        let backend = config.map_or(LlmBackend::OpenRouter, LlmConfig::backend);
+        let model = config.map_or_else(
             || backend.default_model().to_string(),
             |config| config.model().to_string(),
         );
-        let api_url = saved.map_or_else(
+        let api_url = config.map_or_else(
             || backend.default_api_url().to_string(),
             |config| config.api_url().to_string(),
         );
@@ -66,38 +78,16 @@ impl LlmConfigPage {
             }
         }
         Self {
+            name: saved.map_or_else(|| default_name.to_string(), |profile| profile.name().into()),
             backend,
-            api_key: saved.map_or_else(String::new, |config| config.api_key().to_string()),
+            api_key: config.map_or_else(String::new, |config| config.api_key().to_string()),
             model,
             api_url,
             openrouter_model,
             openrouter_api_url,
             local_model,
             local_api_url,
-            active: Self::first_field(backend),
-            reveal_key: false,
-            message: String::new(),
-            load_error,
-            suppress_paste_chars: false,
         }
-    }
-
-    pub(crate) fn open(&mut self) {
-        self.active = Self::first_field(self.backend);
-        self.reveal_key = false;
-        self.message = self.load_error.clone().unwrap_or_default();
-    }
-
-    fn first_field(backend: LlmBackend) -> ConfigField {
-        if backend.requires_api_key() {
-            ConfigField::ApiKey
-        } else {
-            ConfigField::Model
-        }
-    }
-
-    fn shows_api_key(&self) -> bool {
-        self.backend.requires_api_key()
     }
 
     fn select_backend(&mut self, backend: LlmBackend) {
@@ -126,27 +116,171 @@ impl LlmConfigPage {
                 self.api_url.clone_from(&self.local_api_url);
             }
         }
-        self.active = Self::first_field(backend);
-        self.reveal_key = false;
-        self.message.clear();
     }
 
-    fn active_value_mut(&mut self) -> &mut String {
-        match self.active {
+    fn active_value_mut(&mut self, field: ConfigField) -> &mut String {
+        match field {
             ConfigField::ApiKey => &mut self.api_key,
             ConfigField::Model => &mut self.model,
             ConfigField::ApiUrl => &mut self.api_url,
         }
     }
 
+    fn build(&self) -> Result<LlmProfile, String> {
+        let config = LlmConfig::new(
+            self.backend,
+            self.api_key.clone(),
+            self.api_url.clone(),
+            self.model.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        LlmProfile::new(self.name.clone(), config).map_err(|error| error.to_string())
+    }
+}
+
+pub(crate) struct LlmConfigPage {
+    profiles: [ProfileDraft; 2],
+    active_profile: ProfileSlot,
+    human_profile_index: usize,
+    white_enabled: bool,
+    require_pair: bool,
+    active: ConfigField,
+    reveal_key: bool,
+    message: String,
+    load_error: Option<String>,
+    suppress_paste_chars: bool,
+}
+
+impl LlmConfigPage {
+    pub(crate) fn new(saved: Option<&LlmSettings>, load_error: Option<String>) -> Self {
+        let saved_profiles = saved.map(LlmSettings::profiles).unwrap_or_default();
+        let white_default_name = if saved_profiles
+            .first()
+            .is_some_and(|profile| profile.name() == "White")
+        {
+            "White 2"
+        } else {
+            "White"
+        };
+        let profiles = [
+            ProfileDraft::new(saved_profiles.first(), "Black"),
+            ProfileDraft::new(saved_profiles.get(1), white_default_name),
+        ];
+        let white_enabled = saved_profiles.len() > 1;
+        let active_profile = if white_enabled
+            && saved.is_some_and(|settings| settings.active_profile_index() == 1)
+        {
+            ProfileSlot::White
+        } else {
+            ProfileSlot::Black
+        };
+        let active = Self::first_field(profiles[active_profile.index()].backend);
+        Self {
+            profiles,
+            active_profile,
+            human_profile_index: saved.map_or(0, LlmSettings::active_profile_index),
+            white_enabled,
+            require_pair: false,
+            active,
+            reveal_key: false,
+            message: String::new(),
+            load_error,
+            suppress_paste_chars: false,
+        }
+    }
+
+    pub(crate) fn open(&mut self, require_pair: bool) {
+        self.require_pair = require_pair;
+        if require_pair && !self.white_enabled {
+            self.white_enabled = true;
+            self.active_profile = ProfileSlot::White;
+        }
+        self.active = Self::first_field(self.active_draft().backend);
+        self.reveal_key = false;
+        self.message = self.load_error.clone().unwrap_or_default();
+    }
+
+    fn first_field(backend: LlmBackend) -> ConfigField {
+        if backend.requires_api_key() {
+            ConfigField::ApiKey
+        } else {
+            ConfigField::Model
+        }
+    }
+
+    fn shows_api_key(&self) -> bool {
+        self.active_draft().backend.requires_api_key()
+    }
+
+    fn select_backend(&mut self, backend: LlmBackend) {
+        if self.active_draft().backend == backend {
+            return;
+        }
+        self.active_draft_mut().select_backend(backend);
+        self.active = Self::first_field(backend);
+        self.reveal_key = false;
+        self.message.clear();
+    }
+
+    fn select_profile(&mut self, profile: ProfileSlot) {
+        if profile == ProfileSlot::White {
+            self.white_enabled = true;
+        }
+        self.active_profile = profile;
+        self.active = Self::first_field(self.active_draft().backend);
+        self.reveal_key = false;
+        self.message.clear();
+    }
+
+    fn use_one_profile(&mut self) {
+        if self.human_profile_index == ProfileSlot::White.index() {
+            self.profiles.swap(0, 1);
+        }
+        self.white_enabled = false;
+        self.active_profile = ProfileSlot::Black;
+        self.human_profile_index = 0;
+        self.active = Self::first_field(self.active_draft().backend);
+        self.reveal_key = false;
+        self.message = "Second profile will be removed when saved".to_string();
+    }
+
+    fn active_draft(&self) -> &ProfileDraft {
+        &self.profiles[self.active_profile.index()]
+    }
+
+    fn active_draft_mut(&mut self) -> &mut ProfileDraft {
+        &mut self.profiles[self.active_profile.index()]
+    }
+
+    fn active_value_mut(&mut self) -> &mut String {
+        let active = self.active;
+        self.active_draft_mut().active_value_mut(active)
+    }
+
     fn next_field(&mut self) {
-        self.active = match (self.backend.requires_api_key(), self.active) {
+        self.active = match (self.active_draft().backend.requires_api_key(), self.active) {
             (true, ConfigField::ApiKey) => ConfigField::Model,
             (true, ConfigField::Model) => ConfigField::ApiUrl,
             (true, ConfigField::ApiUrl) => ConfigField::ApiKey,
             (false, ConfigField::ApiKey | ConfigField::ApiUrl) => ConfigField::Model,
             (false, ConfigField::Model) => ConfigField::ApiUrl,
         };
+    }
+
+    fn build_settings(&self) -> Result<LlmSettings, String> {
+        let black = self.profiles[ProfileSlot::Black.index()]
+            .build()
+            .map_err(|error| format!("Black: {error}"))?;
+        let mut profiles = vec![black];
+        if self.require_pair || self.white_enabled {
+            profiles.push(
+                self.profiles[ProfileSlot::White.index()]
+                    .build()
+                    .map_err(|error| format!("White: {error}"))?,
+            );
+        }
+        let active_profile = self.human_profile_index.min(profiles.len() - 1);
+        LlmSettings::new(profiles, active_profile).map_err(|error| error.to_string())
     }
 
     fn paste_active(&mut self) {
@@ -227,51 +361,98 @@ impl LlmConfigPage {
         );
 
         draw_text("LLM Configuration", 100.0, 150.0, 28.0, WHITE);
-        let openrouter_backend_rect = Rect::new(350.0, 122.0, 110.0, 34.0);
-        let local_backend_rect = Rect::new(468.0, 122.0, 72.0, 34.0);
+        let black_profile_rect = Rect::new(350.0, 122.0, 90.0, 34.0);
+        let white_profile_rect = Rect::new(448.0, 122.0, 92.0, 34.0);
+        let black_label = if self.require_pair {
+            "Black"
+        } else if self.human_profile_index == ProfileSlot::Black.index() {
+            "Primary"
+        } else {
+            "Opponent"
+        };
+        if draw_choice_button(
+            black_profile_rect,
+            black_label,
+            self.active_profile == ProfileSlot::Black,
+        ) {
+            self.select_profile(ProfileSlot::Black);
+        }
+        let white_label = if self.require_pair {
+            "White"
+        } else if self.white_enabled && self.human_profile_index == ProfileSlot::White.index() {
+            "Primary"
+        } else if self.white_enabled {
+            "Opponent"
+        } else {
+            "Add +"
+        };
+        if draw_choice_button(
+            white_profile_rect,
+            white_label,
+            self.active_profile == ProfileSlot::White,
+        ) {
+            self.select_profile(ProfileSlot::White);
+        }
+
+        draw_text(
+            "Backend",
+            100.0,
+            188.0,
+            18.0,
+            Color::from_rgba(220, 225, 235, 255),
+        );
+        let openrouter_backend_rect = Rect::new(190.0, 163.0, 110.0, 34.0);
+        let local_backend_rect = Rect::new(308.0, 163.0, 72.0, 34.0);
+        let active_backend = self.active_draft().backend;
         if draw_choice_button(
             openrouter_backend_rect,
             "OpenRouter",
-            self.backend == LlmBackend::OpenRouter,
+            active_backend == LlmBackend::OpenRouter,
         ) {
             self.select_backend(LlmBackend::OpenRouter);
         }
         if draw_choice_button(
             local_backend_rect,
             "Local",
-            self.backend == LlmBackend::Local,
+            active_backend == LlmBackend::Local,
         ) {
             self.select_backend(LlmBackend::Local);
+        }
+        if !self.require_pair
+            && self.white_enabled
+            && draw_button(Rect::new(390.0, 163.0, 150.0, 34.0), "Use One Only")
+        {
+            self.use_one_profile();
         }
         let storage_note = config_path().map_or_else(
             |error| format!("Configuration path unavailable: {error}"),
             |path| format!("Saved to {}", path.display()),
         );
-        let storage_note = visible_tail(&storage_note, 64);
+        let storage_note = visible_tail_to_width(&storage_note, 440.0, 15);
         draw_text(
             &storage_note,
             100.0,
-            178.0,
-            16.0,
+            218.0,
+            15.0,
             Color::from_rgba(180, 190, 205, 255),
         );
 
-        let key_rect = Rect::new(100.0, 220.0, 295.0, 38.0);
-        let paste_rect = Rect::new(405.0, 220.0, 65.0, 38.0);
-        let show_rect = Rect::new(480.0, 220.0, 60.0, 38.0);
-        let model_rect = Rect::new(100.0, 305.0, 440.0, 38.0);
-        let url_rect = Rect::new(100.0, 390.0, 440.0, 38.0);
+        let key_rect = Rect::new(100.0, 255.0, 295.0, 38.0);
+        let paste_rect = Rect::new(405.0, 255.0, 65.0, 38.0);
+        let show_rect = Rect::new(480.0, 255.0, 60.0, 38.0);
+        let model_rect = Rect::new(100.0, 335.0, 440.0, 38.0);
+        let url_rect = Rect::new(100.0, 415.0, 440.0, 38.0);
         draw_text(
             "Model",
             100.0,
-            297.0,
+            327.0,
             18.0,
             Color::from_rgba(220, 225, 235, 255),
         );
         draw_text(
             "Chat Completions API URL",
             100.0,
-            382.0,
+            407.0,
             18.0,
             Color::from_rgba(220, 225, 235, 255),
         );
@@ -280,34 +461,42 @@ impl LlmConfigPage {
             draw_text(
                 "OpenRouter API Key",
                 100.0,
-                212.0,
+                247.0,
                 18.0,
                 Color::from_rgba(220, 225, 235, 255),
             );
             let key_display = if self.reveal_key {
-                self.api_key.clone()
+                self.active_draft().api_key.clone()
             } else {
-                "*".repeat(self.api_key.chars().count())
+                masked_api_key(&self.active_draft().api_key)
             };
             draw_field(key_rect, &key_display, self.active == ConfigField::ApiKey);
         } else {
             draw_text(
                 "Local OpenAI-compatible server",
                 100.0,
-                225.0,
+                263.0,
                 18.0,
                 Color::from_rgba(205, 220, 235, 255),
             );
             draw_text(
                 "No key is sent; only 127.0.0.1 or ::1 is allowed.",
                 100.0,
-                250.0,
+                288.0,
                 15.0,
                 Color::from_rgba(155, 190, 170, 255),
             );
         }
-        draw_field(model_rect, &self.model, self.active == ConfigField::Model);
-        draw_field(url_rect, &self.api_url, self.active == ConfigField::ApiUrl);
+        draw_field(
+            model_rect,
+            &self.active_draft().model,
+            self.active == ConfigField::Model,
+        );
+        draw_field(
+            url_rect,
+            &self.active_draft().api_url,
+            self.active == ConfigField::ApiUrl,
+        );
 
         let (mx, my) = mouse_position();
         let clicked = is_mouse_button_pressed(MouseButton::Left);
@@ -338,16 +527,16 @@ impl LlmConfigPage {
         draw_text(
             help,
             100.0,
-            458.0,
+            477.0,
             15.0,
             Color::from_rgba(155, 170, 190, 255),
         );
         if !self.message.is_empty() {
-            let message = visible_head(&self.message, 70);
+            let message = visible_head_to_width(&self.message, 440.0, 16);
             draw_text(
                 &message,
                 100.0,
-                490.0,
+                505.0,
                 16.0,
                 Color::from_rgba(255, 145, 120, 255),
             );
@@ -355,21 +544,21 @@ impl LlmConfigPage {
 
         self.handle_keyboard();
         let cancel = draw_button(Rect::new(330.0, 525.0, 100.0, 40.0), "Cancel");
-        let save = draw_button(Rect::new(440.0, 525.0, 100.0, 40.0), "Save");
+        let save_label = if self.require_pair || self.white_enabled {
+            "Save Both"
+        } else {
+            "Save"
+        };
+        let save = draw_button(Rect::new(440.0, 525.0, 100.0, 40.0), save_label);
         if cancel || is_key_pressed(KeyCode::Escape) {
             return ConfigAction::Cancel;
         }
         if save || is_key_pressed(KeyCode::Enter) {
-            match LlmConfig::new(
-                self.backend,
-                self.api_key.clone(),
-                self.api_url.clone(),
-                self.model.clone(),
-            ) {
-                Ok(config) => match config.save() {
+            match self.build_settings() {
+                Ok(settings) => match settings.save() {
                     Ok(()) => {
                         self.load_error = None;
-                        return ConfigAction::Save(config);
+                        return ConfigAction::Save(settings);
                     }
                     Err(error) => self.message = error.to_string(),
                 },
@@ -394,6 +583,10 @@ fn read_clipboard_text() -> Option<String> {
         }
     }
     None
+}
+
+fn masked_api_key(api_key: &str) -> String {
+    "*".repeat(api_key.chars().count())
 }
 
 fn visible_tail(value: &str, max_chars: usize) -> String {
@@ -429,6 +622,28 @@ fn visible_head(value: &str, max_chars: usize) -> String {
     )
 }
 
+fn visible_head_to_width(value: &str, max_width: f32, font_size: u16) -> String {
+    let mut max_chars = value.chars().count();
+    loop {
+        let candidate = visible_head(value, max_chars);
+        if measure_text(&candidate, None, font_size, 1.0).width <= max_width || max_chars == 0 {
+            return candidate;
+        }
+        max_chars -= 1;
+    }
+}
+
+fn visible_tail_to_width(value: &str, max_width: f32, font_size: u16) -> String {
+    let mut max_chars = value.chars().count();
+    loop {
+        let candidate = visible_tail(value, max_chars);
+        if measure_text(&candidate, None, font_size, 1.0).width <= max_width || max_chars == 0 {
+            return candidate;
+        }
+        max_chars -= 1;
+    }
+}
+
 fn draw_field(rect: Rect, value: &str, active: bool) {
     draw_rectangle(
         rect.x,
@@ -449,7 +664,7 @@ fn draw_field(rect: Rect, value: &str, active: bool) {
             Color::from_rgba(90, 100, 115, 255)
         },
     );
-    let shown = visible_tail(value, 48);
+    let shown = visible_tail_to_width(value, rect.w - 20.0, 18);
     draw_text(&shown, rect.x + 10.0, rect.y + 25.0, 18.0, WHITE);
     if active && (get_time() * 2.0) as i64 % 2 == 0 {
         let width = measure_text(&shown, None, 18, 1.0).width;
@@ -552,14 +767,24 @@ mod tests {
     }
 
     #[test]
+    fn api_key_mask_does_not_expose_sensitive_characters() {
+        let secret = "sk-or-v1-秘密";
+        let masked = masked_api_key(secret);
+
+        assert_eq!(masked, "*".repeat(secret.chars().count()));
+        assert!(!masked.contains("sk-or"));
+        assert!(!masked.contains('秘'));
+    }
+
+    #[test]
     fn pasting_an_api_key_replaces_the_previous_value() {
         let mut page = LlmConfigPage::new(None, None);
         page.active = ConfigField::ApiKey;
-        page.api_key = "old-key".to_string();
+        page.active_draft_mut().api_key = "old-key".to_string();
 
         page.apply_pasted_value("  new-key\n");
 
-        assert_eq!(page.api_key, "new-key");
+        assert_eq!(page.active_draft().api_key, "new-key");
         assert!(page.message.is_empty());
     }
 
@@ -567,11 +792,11 @@ mod tests {
     fn pasting_unicode_replaces_the_previous_model_value() {
         let mut page = LlmConfigPage::new(None, None);
         page.active = ConfigField::Model;
-        page.model = "old-model".to_string();
+        page.active_draft_mut().model = "old-model".to_string();
 
         page.apply_pasted_value("  本地模型🦀\n");
 
-        assert_eq!(page.model, "本地模型🦀");
+        assert_eq!(page.active_draft().model, "本地模型🦀");
         assert!(page.message.is_empty());
     }
 
@@ -579,7 +804,7 @@ mod tests {
     fn opening_configuration_surfaces_a_previous_load_error() {
         let mut page = LlmConfigPage::new(None, Some("Invalid configuration".to_string()));
 
-        page.open();
+        page.open(false);
 
         assert_eq!(page.message, "Invalid configuration");
     }
@@ -587,14 +812,17 @@ mod tests {
     #[test]
     fn selecting_local_applies_ollama_defaults_and_skips_api_key() {
         let mut page = LlmConfigPage::new(None, None);
-        page.api_key = "keep-for-openrouter".to_string();
+        page.active_draft_mut().api_key = "keep-for-openrouter".to_string();
 
         page.select_backend(LlmBackend::Local);
 
-        assert_eq!(page.backend, LlmBackend::Local);
-        assert_eq!(page.model, LlmBackend::Local.default_model());
-        assert_eq!(page.api_url, LlmBackend::Local.default_api_url());
-        assert_eq!(page.api_key, "keep-for-openrouter");
+        assert_eq!(page.active_draft().backend, LlmBackend::Local);
+        assert_eq!(page.active_draft().model, LlmBackend::Local.default_model());
+        assert_eq!(
+            page.active_draft().api_url,
+            LlmBackend::Local.default_api_url()
+        );
+        assert_eq!(page.active_draft().api_key, "keep-for-openrouter");
         assert_eq!(page.active, ConfigField::Model);
         assert!(!page.shows_api_key());
 
@@ -607,21 +835,240 @@ mod tests {
     #[test]
     fn switching_backends_preserves_each_backend_draft() {
         let mut page = LlmConfigPage::new(None, None);
-        page.model = "custom-router-model".to_string();
+        page.active_draft_mut().model = "custom-router-model".to_string();
         page.select_backend(LlmBackend::Local);
-        page.model = "custom-local".to_string();
-        page.api_url = "http://127.0.0.1:1234/v1/chat/completions".to_string();
+        page.active_draft_mut().model = "custom-local".to_string();
+        page.active_draft_mut().api_url = "http://127.0.0.1:1234/v1/chat/completions".to_string();
 
         page.select_backend(LlmBackend::OpenRouter);
 
-        assert_eq!(page.backend, LlmBackend::OpenRouter);
-        assert_eq!(page.model, "custom-router-model");
-        assert_eq!(page.api_url, LlmBackend::OpenRouter.default_api_url());
+        assert_eq!(page.active_draft().backend, LlmBackend::OpenRouter);
+        assert_eq!(page.active_draft().model, "custom-router-model");
+        assert_eq!(
+            page.active_draft().api_url,
+            LlmBackend::OpenRouter.default_api_url()
+        );
         assert_eq!(page.active, ConfigField::ApiKey);
         assert!(page.shows_api_key());
 
         page.select_backend(LlmBackend::Local);
-        assert_eq!(page.model, "custom-local");
-        assert_eq!(page.api_url, "http://127.0.0.1:1234/v1/chat/completions");
+        assert_eq!(page.active_draft().model, "custom-local");
+        assert_eq!(
+            page.active_draft().api_url,
+            "http://127.0.0.1:1234/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn black_and_white_keep_independent_drafts() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.active_draft_mut().model = "black-router".to_string();
+        page.active_draft_mut().api_key = "black-secret".to_string();
+
+        page.select_profile(ProfileSlot::White);
+        page.active_draft_mut().api_key = "white-secret".to_string();
+        page.select_backend(LlmBackend::Local);
+        page.active_draft_mut().model = "white-local".to_string();
+
+        page.select_profile(ProfileSlot::Black);
+        assert_eq!(page.active_draft().backend, LlmBackend::OpenRouter);
+        assert_eq!(page.active_draft().model, "black-router");
+        assert_eq!(page.active_draft().api_key, "black-secret");
+
+        page.select_profile(ProfileSlot::White);
+        assert_eq!(page.active_draft().backend, LlmBackend::Local);
+        assert_eq!(page.active_draft().model, "white-local");
+        assert_eq!(page.active_draft().api_key, "white-secret");
+    }
+
+    #[test]
+    fn entering_the_white_tab_enables_a_second_profile() {
+        let mut page = LlmConfigPage::new(None, None);
+        assert!(!page.white_enabled);
+
+        page.select_profile(ProfileSlot::White);
+
+        assert!(page.white_enabled);
+        assert_eq!(page.active_profile, ProfileSlot::White);
+    }
+
+    #[test]
+    fn pair_configuration_enables_and_focuses_a_missing_white_profile() {
+        let mut page = LlmConfigPage::new(None, None);
+
+        page.open(true);
+
+        assert!(page.require_pair);
+        assert!(page.white_enabled);
+        assert_eq!(page.active_profile, ProfileSlot::White);
+    }
+
+    #[test]
+    fn normal_configuration_can_still_build_one_profile() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.select_backend(LlmBackend::Local);
+
+        let settings = page.build_settings().unwrap();
+
+        assert_eq!(settings.profiles().len(), 1);
+        assert_eq!(settings.active_profile_index(), 0);
+    }
+
+    #[test]
+    fn pair_configuration_reports_an_invalid_white_profile_separately() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.select_backend(LlmBackend::Local);
+        page.open(true);
+
+        let error = match page.build_settings() {
+            Ok(_) => panic!("pair settings should require a valid white profile"),
+            Err(error) => error,
+        };
+
+        assert!(error.starts_with("White:"));
+        assert!(error.contains("API Key"));
+    }
+
+    #[test]
+    fn enabling_white_builds_both_profiles_in_one_settings_value() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.select_backend(LlmBackend::Local);
+        page.select_profile(ProfileSlot::White);
+        page.select_backend(LlmBackend::Local);
+
+        let settings = page.build_settings().unwrap();
+
+        assert_eq!(settings.profiles().len(), 2);
+        assert_eq!(settings.active_profile_index(), 0);
+        assert_eq!(settings.profiles()[0].name(), "Black");
+        assert_eq!(settings.profiles()[1].name(), "White");
+    }
+
+    #[test]
+    fn use_one_profile_removes_the_optional_opponent_on_save() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.select_backend(LlmBackend::Local);
+        page.select_profile(ProfileSlot::White);
+        page.select_backend(LlmBackend::Local);
+
+        page.use_one_profile();
+        let settings = page.build_settings().unwrap();
+
+        assert!(!page.white_enabled);
+        assert_eq!(page.active_profile, ProfileSlot::Black);
+        assert_eq!(settings.profiles().len(), 1);
+        assert_eq!(settings.active_profile_index(), 0);
+    }
+
+    #[test]
+    fn use_one_profile_keeps_the_current_human_ai_when_it_is_in_the_second_slot() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.select_backend(LlmBackend::Local);
+        page.active_draft_mut().model = "opponent-model".to_string();
+        page.select_profile(ProfileSlot::White);
+        page.select_backend(LlmBackend::Local);
+        page.active_draft_mut().model = "primary-model".to_string();
+        page.human_profile_index = 1;
+
+        page.use_one_profile();
+        let settings = page.build_settings().unwrap();
+
+        assert_eq!(settings.profiles().len(), 1);
+        assert_eq!(settings.active_profile_index(), 0);
+        assert_eq!(settings.active_profile().config().model(), "primary-model");
+    }
+
+    #[test]
+    fn constructor_restores_both_profiles_and_the_active_tab() {
+        let black = LlmProfile::new(
+            "Black model",
+            LlmConfig::new(
+                LlmBackend::Local,
+                String::new(),
+                LlmBackend::Local.default_api_url().to_string(),
+                "black-local".to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let white = LlmProfile::new(
+            "White model",
+            LlmConfig::new(
+                LlmBackend::Local,
+                String::new(),
+                LlmBackend::Local.default_api_url().to_string(),
+                "white-local".to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let settings = LlmSettings::new(vec![black, white], 1).unwrap();
+
+        let page = LlmConfigPage::new(Some(&settings), None);
+
+        assert!(page.white_enabled);
+        assert_eq!(page.active_profile, ProfileSlot::White);
+        assert_eq!(page.profiles[0].model, "black-local");
+        assert_eq!(page.profiles[1].model, "white-local");
+    }
+
+    #[test]
+    fn editing_the_other_duel_profile_does_not_change_the_human_ai_profile() {
+        let black = LlmProfile::new(
+            "Black",
+            LlmConfig::new(
+                LlmBackend::Local,
+                String::new(),
+                LlmBackend::Local.default_api_url().to_string(),
+                "black-local".to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let white = LlmProfile::new(
+            "White",
+            LlmConfig::new(
+                LlmBackend::Local,
+                String::new(),
+                LlmBackend::Local.default_api_url().to_string(),
+                "white-local".to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let original = LlmSettings::new(vec![black, white], 0).unwrap();
+        let mut page = LlmConfigPage::new(Some(&original), None);
+
+        page.select_profile(ProfileSlot::White);
+        page.active_draft_mut().model = "edited-white".to_string();
+        let saved = page.build_settings().unwrap();
+
+        assert_eq!(saved.active_profile_index(), 0);
+        assert_eq!(saved.active_profile().config().model(), "black-local");
+        assert_eq!(saved.profiles()[1].config().model(), "edited-white");
+    }
+
+    #[test]
+    fn generated_white_name_does_not_duplicate_an_existing_profile_name() {
+        let profile = LlmProfile::new(
+            "White",
+            LlmConfig::new(
+                LlmBackend::Local,
+                String::new(),
+                LlmBackend::Local.default_api_url().to_string(),
+                "black-local".to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let settings = LlmSettings::new(vec![profile], 0).unwrap();
+        let mut page = LlmConfigPage::new(Some(&settings), None);
+        page.select_profile(ProfileSlot::White);
+        page.select_backend(LlmBackend::Local);
+
+        let settings = page.build_settings().unwrap();
+
+        assert_eq!(settings.profiles()[0].name(), "White");
+        assert_eq!(settings.profiles()[1].name(), "White 2");
     }
 }

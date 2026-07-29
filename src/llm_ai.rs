@@ -16,6 +16,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 const CONFIG_FILE_NAME: &str = "llm_config.json";
+const SETTINGS_SCHEMA_VERSION: u32 = 2;
+const MAX_LLM_PROFILES: usize = 2;
 pub(crate) const DEFAULT_OPENROUTER_API_URL: &str = openrouter::DEFAULT_API_URL;
 pub(crate) const DEFAULT_OPENROUTER_MODEL: &str = openrouter::DEFAULT_MODEL;
 pub(crate) const DEFAULT_LOCAL_API_URL: &str = local::DEFAULT_API_URL;
@@ -74,7 +76,7 @@ impl std::error::Error for ConfigError {
     }
 }
 
-type ConfigResult<T> = Result<T, ConfigError>;
+pub(crate) type ConfigResult<T> = Result<T, ConfigError>;
 
 pub(crate) fn config_path() -> ConfigResult<PathBuf> {
     #[cfg(target_os = "macos")]
@@ -227,6 +229,21 @@ pub(crate) struct LlmConfig {
     model: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct LlmProfile {
+    name: String,
+    #[serde(flatten)]
+    config: LlmConfig,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct LlmSettings {
+    schema_version: u32,
+    profiles: Vec<LlmProfile>,
+    #[serde(default)]
+    active_profile: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct LlmMove {
     pub(crate) position: (usize, usize),
@@ -321,6 +338,100 @@ impl LlmConfig {
         }
     }
 
+    pub(crate) fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    pub(crate) fn backend(&self) -> LlmBackend {
+        self.backend
+    }
+
+    pub(crate) fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+impl LlmProfile {
+    pub(crate) fn new(name: impl Into<String>, config: LlmConfig) -> ConfigResult<Self> {
+        let name = name.into().trim().to_string();
+        if name.is_empty() {
+            return Err(ConfigError::Invalid(
+                "LLM profile name is required".to_string(),
+            ));
+        }
+        Ok(Self { name, config })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn config(&self) -> &LlmConfig {
+        &self.config
+    }
+}
+
+impl LlmSettings {
+    pub(crate) fn new(profiles: Vec<LlmProfile>, active_profile: usize) -> ConfigResult<Self> {
+        if profiles.is_empty() {
+            return Err(ConfigError::Invalid(
+                "At least one LLM profile is required".to_string(),
+            ));
+        }
+        if profiles.len() > MAX_LLM_PROFILES {
+            return Err(ConfigError::Invalid(format!(
+                "At most {MAX_LLM_PROFILES} LLM profiles are supported"
+            )));
+        }
+        if active_profile >= profiles.len() {
+            return Err(ConfigError::Invalid(format!(
+                "Active LLM profile index {active_profile} is out of range"
+            )));
+        }
+
+        let mut normalized = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            let config = normalize_config(profile.config)?;
+            let profile = LlmProfile::new(profile.name, config)?;
+            if normalized
+                .iter()
+                .any(|existing: &LlmProfile| existing.name == profile.name)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "Duplicate LLM profile name: {}",
+                    profile.name
+                )));
+            }
+            normalized.push(profile);
+        }
+
+        Ok(Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            profiles: normalized,
+            active_profile,
+        })
+    }
+
+    pub(crate) fn profiles(&self) -> &[LlmProfile] {
+        &self.profiles
+    }
+
+    pub(crate) fn active_profile(&self) -> &LlmProfile {
+        &self.profiles[self.active_profile]
+    }
+
+    pub(crate) fn active_profile_index(&self) -> usize {
+        self.active_profile
+    }
+
+    pub(crate) fn arena_pair(&self) -> Option<(&LlmProfile, &LlmProfile)> {
+        (self.profiles.len() == MAX_LLM_PROFILES).then(|| (&self.profiles[0], &self.profiles[1]))
+    }
+
     pub(crate) fn load() -> ConfigResult<Self> {
         let current = config_path()?;
         let legacy = legacy_config_path();
@@ -329,17 +440,17 @@ impl LlmConfig {
 
     fn load_with_paths(current: &Path, legacy: &Path) -> ConfigResult<Self> {
         if current.exists() {
-            let (config, repaired) = Self::read_from_path(current)?;
+            let (settings, repaired) = Self::read_from_path(current)?;
             if repaired {
-                config.save_to_path(current)?;
+                settings.save_to_path(current)?;
             }
-            return Ok(config);
+            return Ok(settings);
         }
         if legacy.exists() {
             // Never modify the legacy source. Apply repairs in memory and write
             // the final configuration directly to the system location.
-            let (config, _) = Self::read_from_path(legacy)?;
-            config.save_to_path(current)?;
+            let (settings, _) = Self::read_from_path(legacy)?;
+            settings.save_to_path(current)?;
             let archived = migrated_legacy_config_path(legacy);
             if archived.exists() {
                 secure_legacy_file(legacy);
@@ -363,9 +474,9 @@ impl LlmConfig {
                     secure_legacy_file(&archived);
                 }
             }
-            return Ok(config);
+            return Ok(settings);
         }
-        Self::read_from_path(current).map(|(config, _)| config)
+        Self::read_from_path(current).map(|(settings, _)| settings)
     }
 
     fn read_from_path(path: &Path) -> ConfigResult<(Self, bool)> {
@@ -375,19 +486,84 @@ impl LlmConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        let backend_was_missing = value.get("backend").is_none();
-        let api_key_was_present = value.get("api_key").is_some();
-        let mut raw: Self = serde_json::from_value(value).map_err(|source| ConfigError::Json {
+
+        if value.get("profiles").is_some() || value.get("schema_version").is_some() {
+            Self::read_versioned_value(value, path)
+        } else {
+            Self::read_legacy_value(value, path)
+        }
+    }
+
+    fn read_versioned_value(value: Value, path: &Path) -> ConfigResult<(Self, bool)> {
+        let version = value
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "Missing or invalid schema_version in {}",
+                    path.display()
+                ))
+            })?;
+        if version > u64::from(SETTINGS_SCHEMA_VERSION) {
+            return Err(ConfigError::Invalid(format!(
+                "Unsupported future LLM configuration schema version {version}"
+            )));
+        }
+        if version != u64::from(SETTINGS_SCHEMA_VERSION) {
+            return Err(ConfigError::Invalid(format!(
+                "Unsupported LLM configuration schema version {version}"
+            )));
+        }
+
+        let backend_was_missing =
+            value
+                .get("profiles")
+                .and_then(Value::as_array)
+                .is_some_and(|profiles| {
+                    profiles
+                        .iter()
+                        .any(|profile| profile.get("backend").is_none())
+                });
+        let active_profile_was_missing = value.get("active_profile").is_none();
+        let raw: Self = serde_json::from_value(value).map_err(|source| ConfigError::Json {
             path: path.to_path_buf(),
             source,
         })?;
-        let repaired = repair_paste_artifact(&raw.api_key);
-        let changed = repaired != raw.api_key
-            || backend_was_missing
-            || (raw.backend == LlmBackend::Local && api_key_was_present);
-        raw.api_key = repaired;
-        let config = Self::new(raw.backend, raw.api_key, raw.api_url, raw.model)?;
-        Ok((config, changed))
+        let raw_names = raw
+            .profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect::<Vec<_>>();
+        let raw_configs = raw
+            .profiles
+            .iter()
+            .map(|profile| profile.config.clone())
+            .collect::<Vec<_>>();
+        let settings = Self::new(raw.profiles, raw.active_profile)?;
+        let changed = backend_was_missing
+            || active_profile_was_missing
+            || settings
+                .profiles
+                .iter()
+                .zip(raw_names.iter().zip(raw_configs))
+                .any(|(profile, (raw_name, raw_config))| {
+                    profile.name.as_str() != raw_name.as_str()
+                        || profile.config.backend != raw_config.backend
+                        || profile.config.api_key != raw_config.api_key
+                        || profile.config.api_url != raw_config.api_url
+                        || profile.config.model != raw_config.model
+                });
+        Ok((settings, changed))
+    }
+
+    fn read_legacy_value(value: Value, path: &Path) -> ConfigResult<(Self, bool)> {
+        let raw: LlmConfig = serde_json::from_value(value).map_err(|source| ConfigError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let config = normalize_config(raw)?;
+        let profile = LlmProfile::new(config.model().to_string(), config)?;
+        Ok((Self::new(vec![profile], 0)?, true))
     }
 
     pub(crate) fn save(&self) -> ConfigResult<()> {
@@ -395,63 +571,56 @@ impl LlmConfig {
     }
 
     fn save_to_path(&self, path: &Path) -> ConfigResult<()> {
-        let json = serde_json::to_string_pretty(self).map_err(|error| {
-            ConfigError::Invalid(format!("Cannot serialize {}: {error}", path.display()))
-        })?;
-        let directory = path.parent().ok_or_else(|| {
-            ConfigError::Path(format!("Invalid configuration path: {}", path.display()))
-        })?;
-        std::fs::create_dir_all(directory)
-            .map_err(|error| ConfigError::io("create", directory, error))?;
+        write_json_atomically(self, path)
+    }
+}
+
+fn normalize_config(raw: LlmConfig) -> ConfigResult<LlmConfig> {
+    let repaired_key = repair_paste_artifact(&raw.api_key);
+    LlmConfig::new(raw.backend, repaired_key, raw.api_url, raw.model)
+}
+
+fn write_json_atomically(value: &impl Serialize, path: &Path) -> ConfigResult<()> {
+    let json = serde_json::to_string_pretty(value).map_err(|error| {
+        ConfigError::Invalid(format!("Cannot serialize {}: {error}", path.display()))
+    })?;
+    let directory = path.parent().ok_or_else(|| {
+        ConfigError::Path(format!("Invalid configuration path: {}", path.display()))
+    })?;
+    std::fs::create_dir_all(directory)
+        .map_err(|error| ConfigError::io("create", directory, error))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| ConfigError::io("secure", directory, error))?;
+    let temporary = temporary_config_path(path);
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let result = (|| {
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| ConfigError::io("create", &temporary, error))?;
+        file.write_all(json.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.sync_all())
+            .map_err(|error| ConfigError::io("write", &temporary, error))?;
+        drop(file);
         #[cfg(unix)]
-        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| ConfigError::io("secure", directory, error))?;
-        let temporary = temporary_config_path(path);
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| ConfigError::io("secure", &temporary, error))?;
+        replace_config_file(&temporary, path)
+            .map_err(|error| ConfigError::io("replace", path, error))?;
         #[cfg(unix)]
-        options.mode(0o600);
-        let result = (|| {
-            let mut file = options
-                .open(&temporary)
-                .map_err(|error| ConfigError::io("create", &temporary, error))?;
-            file.write_all(json.as_bytes())
-                .and_then(|_| file.write_all(b"\n"))
-                .and_then(|_| file.sync_all())
-                .map_err(|error| ConfigError::io("write", &temporary, error))?;
-            drop(file);
-            #[cfg(unix)]
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| ConfigError::io("secure", &temporary, error))?;
-            replace_config_file(&temporary, path)
-                .map_err(|error| ConfigError::io("replace", path, error))?;
-            #[cfg(unix)]
-            std::fs::File::open(directory)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| ConfigError::io("sync", directory, error))?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        result
+        std::fs::File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| ConfigError::io("sync", directory, error))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-
-    pub(crate) fn api_key(&self) -> &str {
-        &self.api_key
-    }
-
-    pub(crate) fn backend(&self) -> LlmBackend {
-        self.backend
-    }
-
-    pub(crate) fn api_url(&self) -> &str {
-        &self.api_url
-    }
-
-    pub(crate) fn model(&self) -> &str {
-        &self.model
-    }
+    result
 }
 
 /// 修复旧版配置页在 Cmd+V 后错误追加的单个字符 `v`。
@@ -545,14 +714,21 @@ pub(crate) async fn request_move(
     client: &reqwest::Client,
     config: &LlmConfig,
     board: &[[Cell; BOARD]; BOARD],
+    side: Cell,
     candidates: &[(usize, usize)],
 ) -> Result<LlmMove, String> {
+    let (side_name, side_stone, opponent_name, opponent_stone) = match side {
+        Cell::Black => ("黑", 'X', "白", 'O'),
+        Cell::White => ("白", 'O', "黑", 'X'),
+        Cell::Empty => return Err("大模型执子方不能是空棋子".to_string()),
+    };
     if candidates.is_empty() {
         return Err("没有合法候选点".to_string());
     }
 
     let prompt = format!(
-        "你执白棋 O，对手执黑棋 X，坐标从 0 到 14，格式为 (x,y)，左上角是 (0,0)。\n\
+        "你执{side_name}棋 {side_stone}，对手执{opponent_name}棋 {opponent_stone}，当前轮到你落子。\
+         坐标从 0 到 14，格式为 (x,y)，左上角是 (0,0)。\n\
          当前棋盘（每行对应 y=0..14）：\n{}\n\
          战术引擎给出的合法候选点：{:?}\n\
          综合进攻、防守、后续威胁和中心控制，选出最佳一手。只能从候选点中选择。",
@@ -562,8 +738,9 @@ pub(crate) async fn request_move(
     let messages = [
         ChatMessage {
             role: "system",
-            content: "你是五子棋专家。只输出一个 JSON 对象，例如 {\"x\":7,\"y\":7}，不要解释。"
-                .to_string(),
+            content:
+                "你是五子棋专家。根据当前执子方选择最佳落点。只输出一个 JSON 对象，例如 {\"x\":7,\"y\":7}，不要解释。"
+                    .to_string(),
         },
         ChatMessage {
             role: "user",
