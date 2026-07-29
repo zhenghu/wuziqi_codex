@@ -1,9 +1,19 @@
-use super::super::ai::{
+use super::{
     ai_move, double_threat_moves, immediate_winning_moves, line_stat, llm_candidate_moves,
     near_stone, pattern_score, point_score,
 };
-use super::super::game::{BOARD, CENTER, Cell};
-use super::support::{empty_board, put};
+use crate::game::{BOARD, CENTER, Cell, Game, Mode, Status};
+use crate::test_support::{Board, empty_board, put};
+
+fn reachable_board(moves: &[(usize, usize)]) -> Board {
+    let mut game = Game::new(Mode::HumanVsHuman);
+    for &(x, y) in moves {
+        assert!(x < BOARD && y < BOARD);
+        assert!(game.place(x, y));
+    }
+    assert_eq!(game.status, Status::Playing);
+    game.board
+}
 
 #[test]
 fn line_stat_counts_contiguous_stones_and_open_ends() {
@@ -93,15 +103,64 @@ fn ai_prefers_its_own_win_over_blocking() {
 }
 
 #[test]
-fn ai_is_deterministic_and_returns_a_legal_move() {
-    let mut board = empty_board();
-    board[7][7] = Cell::Black;
-    let before = board;
-    let first = ai_move(&board, Cell::White, 1);
-    let second = ai_move(&board, Cell::White, 1);
-    assert_eq!(first, second);
-    assert_eq!(board[first.1][first.0], Cell::Empty);
-    assert_eq!(board, before);
+fn ai_returns_legal_moves_without_mutating_representative_positions() {
+    let positions: &[&[(usize, usize)]] = &[
+        &[(7, 7)],
+        &[(7, 7), (6, 7), (8, 7), (7, 6), (8, 8), (6, 8)],
+        &[
+            (7, 7),
+            (7, 8),
+            (8, 7),
+            (6, 7),
+            (8, 8),
+            (6, 8),
+            (9, 8),
+            (5, 8),
+            (9, 9),
+            (5, 9),
+            (10, 10),
+        ],
+        &[
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (2, 2),
+            (3, 2),
+            (4, 2),
+            (4, 3),
+            (5, 3),
+            (6, 4),
+            (6, 5),
+        ],
+    ];
+
+    for (case_index, moves) in positions.iter().enumerate() {
+        let board = reachable_board(moves);
+        let before = board;
+        let ai = if moves.len().is_multiple_of(2) {
+            Cell::Black
+        } else {
+            Cell::White
+        };
+
+        let chosen = ai_move(&board, ai, moves.len());
+
+        assert!(
+            chosen.0 < BOARD && chosen.1 < BOARD,
+            "case {case_index} returned an out-of-bounds move"
+        );
+        assert_eq!(
+            board[chosen.1][chosen.0],
+            Cell::Empty,
+            "case {case_index} returned an occupied point"
+        );
+        assert_eq!(
+            board, before,
+            "case {case_index} mutated the input position"
+        );
+    }
 }
 
 #[test]

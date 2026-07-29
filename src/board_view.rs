@@ -260,3 +260,40 @@ impl Button {
         hover && is_mouse_button_pressed(MouseButton::Left)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cell_centers_round_trip_to_board_coordinates() {
+        for y in 0..BOARD {
+            for x in 0..BOARD {
+                let (px, py) = cell_center(x, y);
+                assert_eq!(pixel_to_cell(px, py), Some((x, y)));
+            }
+        }
+    }
+
+    #[test]
+    fn pixels_outside_the_board_are_rejected() {
+        let (first_x, first_y) = cell_center(0, 0);
+        let (last_x, last_y) = cell_center(BOARD - 1, BOARD - 1);
+
+        assert_eq!(pixel_to_cell(first_x - CELL, first_y), None);
+        assert_eq!(pixel_to_cell(first_x, first_y - CELL), None);
+        assert_eq!(pixel_to_cell(last_x + CELL, last_y), None);
+        assert_eq!(pixel_to_cell(last_x, last_y + CELL), None);
+    }
+
+    #[test]
+    fn pixel_snapping_honors_the_four_tenths_cell_threshold() {
+        let (cx, cy) = cell_center(0, 0);
+        let threshold = CELL * 0.4;
+
+        assert_eq!(pixel_to_cell(cx + threshold, cy), Some((0, 0)));
+        assert_eq!(pixel_to_cell(cx, cy + threshold), Some((0, 0)));
+        assert_eq!(pixel_to_cell(cx + threshold + 0.01, cy), None);
+        assert_eq!(pixel_to_cell(cx, cy + threshold + 0.01), None);
+    }
+}
