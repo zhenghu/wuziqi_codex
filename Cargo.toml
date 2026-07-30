@@ -1,6 +1,6 @@
 [package]
 name = "wuziqi"
-version = "0.2.0-beta.1"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.87"
 description = "A native and web Gomoku game with tactical-search and optional cloud or local LLM AI"

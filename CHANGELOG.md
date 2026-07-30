@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-30
+
 ### 新增
 
 - OpenRouter 请求失败后显示失败原因，最多自动尝试 3 次，再降级到战术搜索
@@ -34,5 +36,6 @@
 - 强制大模型 API 使用 OpenRouter 官方 HTTPS 端点
 - 加强跨平台 CI、错误处理和配置安全性
 
-[Unreleased]: https://github.com/zhenghu/wuziqi_codex/compare/v0.2.0-beta.1...HEAD
+[Unreleased]: https://github.com/zhenghu/wuziqi_codex/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/zhenghu/wuziqi_codex/compare/v0.2.0-beta.1...v1.0.0
 [0.2.0-beta.1]: https://github.com/zhenghu/wuziqi_codex/compare/2b2cf6e...v0.2.0-beta.1

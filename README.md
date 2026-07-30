@@ -2,7 +2,7 @@
 
 用 Rust 2024 Edition + [macroquad](https://github.com/not-fl3/macroquad) 编写的五子棋小游戏。原生版支持人机对战、双人对战和双模型擂台，网页移植版支持无需安装的经典 AI 与双人对战。
 
-当前版本：`0.2.0-beta.1`
+当前版本：`1.0.0`
 
 ## 版本管理
 
