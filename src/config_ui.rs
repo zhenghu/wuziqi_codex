@@ -45,6 +45,7 @@ struct ProfileDraft {
     api_key: String,
     model: String,
     api_url: String,
+    no_reasoning: bool,
     openrouter_model: String,
     openrouter_api_url: String,
     local_model: String,
@@ -83,6 +84,7 @@ impl ProfileDraft {
             api_key: config.map_or_else(String::new, |config| config.api_key().to_string()),
             model,
             api_url,
+            no_reasoning: config.is_some_and(LlmConfig::no_reasoning_enabled),
             openrouter_model,
             openrouter_api_url,
             local_model,
@@ -133,7 +135,8 @@ impl ProfileDraft {
             self.api_url.clone(),
             self.model.clone(),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .no_reasoning(self.no_reasoning);
         LlmProfile::new(self.name.clone(), config).map_err(|error| error.to_string())
     }
 }
@@ -498,6 +501,31 @@ impl LlmConfigPage {
             self.active == ConfigField::ApiUrl,
         );
 
+        let no_reasoning_rect = Rect::new(100.0, 464.0, 18.0, 18.0);
+        if self.shows_api_key() {
+            let draft = self.active_draft();
+            let checked = draft.no_reasoning;
+            if checked {
+                draw_rectangle(100.0, 464.0, 18.0, 18.0, Color::from_rgba(120, 200, 160, 255));
+                draw_text(
+                    "✓",
+                    103.0,
+                    479.0,
+                    16.0,
+                    Color::from_rgba(20, 40, 30, 255),
+                );
+            } else {
+                draw_rectangle_lines(100.0, 464.0, 18.0, 18.0, 2.0, Color::from_rgba(180, 190, 205, 255));
+            }
+            draw_text(
+                "No reasoning (DeepSeek reasoning models)",
+                128.0,
+                478.0,
+                15.0,
+                Color::from_rgba(220, 225, 235, 255),
+            );
+        }
+
         let (mx, my) = mouse_position();
         let clicked = is_mouse_button_pressed(MouseButton::Left);
         if self.shows_api_key() && clicked && key_rect.contains(vec2(mx, my)) {
@@ -508,6 +536,9 @@ impl LlmConfigPage {
         }
         if clicked && url_rect.contains(vec2(mx, my)) {
             self.active = ConfigField::ApiUrl;
+        }
+        if self.shows_api_key() && clicked && no_reasoning_rect.contains(vec2(mx, my)) {
+            self.active_draft_mut().no_reasoning = !self.active_draft().no_reasoning;
         }
         if self.shows_api_key() {
             if draw_button(paste_rect, "Paste") {
@@ -527,7 +558,7 @@ impl LlmConfigPage {
         draw_text(
             help,
             100.0,
-            477.0,
+            508.0,
             15.0,
             Color::from_rgba(155, 170, 190, 255),
         );
@@ -536,7 +567,7 @@ impl LlmConfigPage {
             draw_text(
                 &message,
                 100.0,
-                505.0,
+                530.0,
                 16.0,
                 Color::from_rgba(255, 145, 120, 255),
             );

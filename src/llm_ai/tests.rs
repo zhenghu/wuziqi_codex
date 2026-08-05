@@ -172,7 +172,7 @@ fn run_request_for_side(
     candidates: &[(usize, usize)],
 ) -> Result<LlmMove, String> {
     let client = match config.backend() {
-        LlmBackend::OpenRouter => build_openrouter_client(),
+        LlmBackend::OpenRouter => build_cloud_client(),
         LlmBackend::Local => build_local_client(),
     }
     .unwrap();
@@ -186,6 +186,7 @@ fn run_request_for_side(
             &[[Cell::Empty; BOARD]; BOARD],
             side,
             candidates,
+            &[],
         ))
 }
 
@@ -204,6 +205,33 @@ fn parses_json_and_plain_coordinates() {
     assert_eq!(parse_move("(12, 3)"), Some((12, 3)));
     assert_eq!(parse_move("选择 (12, 3)，因为它最好"), Some((12, 3)));
     assert_eq!(parse_move("7 8 9"), None);
+}
+
+#[test]
+fn parses_coordinates_surrounded_by_explanatory_text() {
+    // 推理模型在 JSON 前后附带的解释文字
+    assert_eq!(
+        parse_move(r#"我选择 {"x":7,"y":7}，因为候选点 (7,7) 在中心位置"#),
+        Some((7, 7))
+    );
+    // Markdown 代码块包裹
+    assert_eq!(
+        parse_move("```json\n{\"x\":7,\"y\":7}\n```"),
+        Some((7, 7))
+    );
+    // JSON 带空格与中文冒号
+    assert_eq!(parse_move(r#"答案是 {"x"： 7 ，"y"： 8}"#), Some((7, 8)));
+    // 只有 x/y 键值对，无 JSON 整体
+    assert_eq!(parse_move("落点 x=3 y=4"), Some((3, 4)));
+    // 中文逗号的括号坐标
+    assert_eq!(parse_move("选择（12，3）这个点"), Some((12, 3)));
+    // 解释里包含其他数字也不会干扰括号坐标
+    assert_eq!(
+        parse_move("我考虑过 (5,5) 和 (12,3)，最终选择 (12,3) 因为 5 号位被占"),
+        Some((12, 3))
+    );
+    // 数字多于两个且无坐标结构时仍拒绝
+    assert_eq!(parse_move("7 8 9 10"), None);
 }
 
 #[test]
@@ -293,8 +321,8 @@ fn legacy_json_configuration_defaults_to_openrouter() {
         LlmConfig::new(parsed.backend, parsed.api_key, parsed.api_url, parsed.model).unwrap();
     assert_eq!(config.backend(), LlmBackend::OpenRouter);
     assert_eq!(config.api_key(), "sk-or-test");
-    assert_eq!(config.api_url(), DEFAULT_OPENROUTER_API_URL);
-    assert_eq!(config.model(), DEFAULT_OPENROUTER_MODEL);
+    assert_eq!(config.api_url(), DEFAULT_CLOUD_API_URL);
+    assert_eq!(config.model(), DEFAULT_CLOUD_MODEL);
 }
 
 #[test]
@@ -304,7 +332,7 @@ fn settings_support_two_named_profiles_and_an_active_profile() {
         LlmConfig::new(
             LlmBackend::OpenRouter,
             "cloud-key".into(),
-            DEFAULT_OPENROUTER_API_URL.into(),
+            DEFAULT_CLOUD_API_URL.into(),
             "cloud-model".into(),
         )
         .unwrap(),
@@ -386,7 +414,7 @@ fn validates_openrouter_configuration() {
         LlmConfig::new(
             LlmBackend::OpenRouter,
             "key".into(),
-            DEFAULT_OPENROUTER_API_URL.into(),
+            DEFAULT_CLOUD_API_URL.into(),
             "model".into()
         )
         .is_ok()
@@ -395,7 +423,7 @@ fn validates_openrouter_configuration() {
         LlmConfig::new(
             LlmBackend::OpenRouter,
             "".into(),
-            DEFAULT_OPENROUTER_API_URL.into(),
+            DEFAULT_CLOUD_API_URL.into(),
             "model".into()
         )
         .is_err()
@@ -419,25 +447,25 @@ fn validates_openrouter_configuration() {
         .err()
         .map(|error| error.to_string())
         .as_deref(),
-        Some("OpenRouter API URL must use HTTPS")
+        Some("Cloud API URL must use HTTPS")
     );
     assert_eq!(
         LlmConfig::new(
             LlmBackend::OpenRouter,
             "key".into(),
-            "https://example.com/api/v1/chat/completions".into(),
+            "http://example.com/api/v1/chat/completions".into(),
             "model".into()
         )
         .err()
         .map(|error| error.to_string())
         .as_deref(),
-        Some("OpenRouter API URL host must be openrouter.ai")
+        Some("Cloud API URL must use HTTPS")
     );
     assert!(
         LlmConfig::new(
             LlmBackend::OpenRouter,
             "key".into(),
-            "https://openrouter.ai/api/v1".into(),
+            "http://openrouter.ai/api/v1".into(),
             "model".into()
         )
         .is_err()
@@ -446,7 +474,7 @@ fn validates_openrouter_configuration() {
         LlmConfig::new(
             LlmBackend::OpenRouter,
             "key".into(),
-            DEFAULT_OPENROUTER_API_URL.into(),
+            DEFAULT_CLOUD_API_URL.into(),
             "".into()
         )
         .is_err()
@@ -500,7 +528,7 @@ fn migrates_legacy_configuration_to_the_system_path() {
     std::fs::write(
         &legacy,
         format!(
-            r#"{{"api_key":"{legacy_key}","api_url":"{DEFAULT_OPENROUTER_API_URL}","model":"model"}}"#
+            r#"{{"api_key":"{legacy_key}","api_url":"{DEFAULT_CLOUD_API_URL}","model":"model"}}"#
         ),
     )
     .unwrap();
@@ -545,7 +573,7 @@ fn upgrades_a_current_three_field_configuration_in_place() {
     let missing_legacy = root.join("missing").join(CONFIG_FILE_NAME);
     std::fs::write(
         &current,
-        format!(r#"{{"api_key":"key","api_url":"{DEFAULT_OPENROUTER_API_URL}","model":"model"}}"#),
+        format!(r#"{{"api_key":"key","api_url":"{DEFAULT_CLOUD_API_URL}","model":"model"}}"#),
     )
     .unwrap();
 
@@ -574,7 +602,7 @@ fn two_profile_settings_round_trip_in_one_versioned_file() {
                 LlmConfig::new(
                     LlmBackend::OpenRouter,
                     "cloud-key".into(),
-                    DEFAULT_OPENROUTER_API_URL.into(),
+                    DEFAULT_CLOUD_API_URL.into(),
                     "cloud-model".into(),
                 )
                 .unwrap(),
@@ -657,7 +685,7 @@ fn loading_versioned_settings_scrubs_a_cloud_key_from_a_local_profile() {
                         "name":"Cloud",
                         "backend":"openrouter",
                         "api_key":"cloud-key",
-                        "api_url":"{DEFAULT_OPENROUTER_API_URL}",
+                        "api_url":"{DEFAULT_CLOUD_API_URL}",
                         "model":"cloud-model"
                     }},
                     {{
@@ -772,7 +800,7 @@ fn atomically_replaces_an_existing_configuration() {
                 LlmConfig::new(
                     LlmBackend::OpenRouter,
                     "old-key".into(),
-                    DEFAULT_OPENROUTER_API_URL.into(),
+                    DEFAULT_CLOUD_API_URL.into(),
                     "old".into(),
                 )
                 .unwrap(),
@@ -790,7 +818,7 @@ fn atomically_replaces_an_existing_configuration() {
                 LlmConfig::new(
                     LlmBackend::OpenRouter,
                     "new-key".into(),
-                    DEFAULT_OPENROUTER_API_URL.into(),
+                    DEFAULT_CLOUD_API_URL.into(),
                     "new".into(),
                 )
                 .unwrap(),
@@ -947,7 +975,7 @@ fn rejects_a_move_outside_the_candidate_set() {
 }
 
 #[test]
-fn openrouter_requires_the_routed_model_in_a_successful_response() {
+fn cloud_apis_without_a_routed_model_fall_back_to_the_configured_model() {
     let server = TestServer::new(
         "200 OK",
         r#"{"choices":[{"message":{"content":"{\"x\":7,\"y\":7}"}}]}"#,
@@ -956,13 +984,15 @@ fn openrouter_requires_the_routed_model_in_a_successful_response() {
         LlmBackend::OpenRouter,
         "openrouter-secret".into(),
         server.url().to_string(),
-        DEFAULT_OPENROUTER_MODEL.into(),
+        "my-model".into(),
     );
 
-    let error = run_request(&config, &[(7, 7)]).unwrap_err();
+    let llm_move = run_request(&config, &[(7, 7)]).unwrap();
     server.finish();
 
-    assert_eq!(error, "OpenRouter response is missing the routed model");
+    assert_eq!(llm_move.position, (7, 7));
+    assert_eq!(llm_move.model, "my-model");
+    assert_eq!(llm_move.provider, None);
 }
 
 #[test]
@@ -995,7 +1025,7 @@ fn local_request_never_sends_cloud_credentials_or_openrouter_fields() {
 }
 
 #[test]
-fn openrouter_request_still_sends_its_credentials_and_headers() {
+fn cloud_api_request_uses_standard_openai_compatible_format() {
     let server = TestServer::new(
         "200 OK",
         r#"{
@@ -1008,7 +1038,7 @@ fn openrouter_request_still_sends_its_credentials_and_headers() {
         LlmBackend::OpenRouter,
         "openrouter-secret".into(),
         server.url().to_string(),
-        DEFAULT_OPENROUTER_MODEL.into(),
+        DEFAULT_CLOUD_MODEL.into(),
     );
 
     run_request(&config, &[(7, 7)]).unwrap();
@@ -1016,7 +1046,40 @@ fn openrouter_request_still_sends_its_credentials_and_headers() {
     let request_lowercase = request.to_ascii_lowercase();
 
     assert!(request_lowercase.contains("authorization: bearer openrouter-secret"));
-    assert!(request_lowercase.contains("x-openrouter-title: wuziqi"));
-    assert!(request.contains("\"reasoning\""));
-    assert!(request.contains("\"max_completion_tokens\":1024"));
+    // 标准 OpenAI 兼容格式：无 OpenRouter 专属 header，无 reasoning 字段
+    assert!(!request_lowercase.contains("x-openrouter-title:"));
+    assert!(request.contains("\"max_tokens\":1024"));
+    assert!(!request.contains("\"reasoning\""));
+    assert!(!request.contains("\"max_completion_tokens\""));
+}
+
+#[test]
+fn deserializes_no_reasoning_from_json() {
+    let raw = r#"{
+        "schema_version": 2,
+        "profiles": [{
+            "name": "test",
+            "backend": "openrouter",
+            "api_key": "sk-test",
+            "api_url": "https://api.deepseek.com/chat/completions",
+            "model": "deepseek-v4-flash",
+            "no_reasoning": true
+        }],
+        "active_profile": 0
+    }"#;
+    let settings: LlmSettings = serde_json::from_str(raw).unwrap();
+    assert!(settings.active_profile().config().no_reasoning_enabled());
+
+    let without: LlmSettings = serde_json::from_str(r#"{
+        "schema_version": 2,
+        "profiles": [{
+            "name": "test",
+            "backend": "openrouter",
+            "api_key": "sk-test",
+            "api_url": "https://api.deepseek.com/chat/completions",
+            "model": "m"
+        }],
+        "active_profile": 0
+    }"#).unwrap();
+    assert!(!without.active_profile().config().no_reasoning_enabled());
 }

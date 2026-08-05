@@ -5,7 +5,7 @@ use crate::board_view::{self, Button, TOP_BAR, WIN_H, WIN_W};
 use crate::config_ui::{ConfigAction, LlmConfigPage};
 use crate::game::{Cell, Game, Mode, Status, opponent};
 use crate::llm_ai::{
-    LlmBackend, LlmConfig, LlmMove, LlmSettings, build_local_client, build_openrouter_client,
+    LlmBackend, LlmConfig, LlmMove, LlmSettings, build_cloud_client, build_local_client,
     config_exists, request_move,
 };
 use macroquad::prelude::*;
@@ -35,6 +35,8 @@ struct LlmTurnRequest {
     config: LlmConfig,
     board: [[Cell; crate::game::BOARD]; crate::game::BOARD],
     candidates: Vec<(usize, usize)>,
+    /// 重试时累积的已被模型选过但不可用的位置，用于提示模型避开。
+    excluded: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +60,7 @@ enum LlmCommand {
         side: Cell,
         board: Box<[[Cell; crate::game::BOARD]; crate::game::BOARD]>,
         candidates: Vec<(usize, usize)>,
+        excluded: Vec<(usize, usize)>,
         result: mpsc::Sender<Result<LlmMove, String>>,
     },
     Cancel,
@@ -74,6 +77,7 @@ trait LlmRequestWorker {
         side: Cell,
         board: [[Cell; crate::game::BOARD]; crate::game::BOARD],
         candidates: Vec<(usize, usize)>,
+        excluded: Vec<(usize, usize)>,
     ) -> Result<Receiver<Result<LlmMove, String>>, String>;
 
     fn cancel(&self);
@@ -81,7 +85,7 @@ trait LlmRequestWorker {
 
 impl LlmWorker {
     fn new() -> Result<Self, String> {
-        let cloud_client = build_openrouter_client()?;
+        let cloud_client = build_cloud_client()?;
         let local_client = build_local_client()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -107,6 +111,7 @@ impl LlmWorker {
                                 side,
                                 board,
                                 candidates,
+                                excluded,
                                 result,
                             } => {
                                 let client = match config.backend() {
@@ -114,9 +119,15 @@ impl LlmWorker {
                                     LlmBackend::Local => local_client.clone(),
                                 };
                                 active = Some(tokio::spawn(async move {
-                                    let response =
-                                        request_move(&client, &config, &board, side, &candidates)
-                                            .await;
+                                    let response = request_move(
+                                        &client,
+                                        &config,
+                                        &board,
+                                        side,
+                                        &candidates,
+                                        &excluded,
+                                    )
+                                    .await;
                                     let _ = result.send(response);
                                 }));
                             }
@@ -138,6 +149,7 @@ impl LlmWorker {
         side: Cell,
         board: [[Cell; crate::game::BOARD]; crate::game::BOARD],
         candidates: Vec<(usize, usize)>,
+        excluded: Vec<(usize, usize)>,
     ) -> Result<Receiver<Result<LlmMove, String>>, String> {
         let (result, receiver) = mpsc::channel();
         self.commands
@@ -146,6 +158,7 @@ impl LlmWorker {
                 side,
                 board: Box::new(board),
                 candidates,
+                excluded,
                 result,
             })
             .map_err(|_| "LLM worker has stopped".to_string())?;
@@ -164,8 +177,9 @@ impl LlmRequestWorker for LlmWorker {
         side: Cell,
         board: [[Cell; crate::game::BOARD]; crate::game::BOARD],
         candidates: Vec<(usize, usize)>,
+        excluded: Vec<(usize, usize)>,
     ) -> Result<Receiver<Result<LlmMove, String>>, String> {
-        LlmWorker::request(self, config, side, board, candidates)
+        LlmWorker::request(self, config, side, board, candidates, excluded)
     }
 
     fn cancel(&self) {
@@ -609,6 +623,7 @@ impl App {
             config,
             board,
             candidates,
+            excluded: Vec::new(),
         };
         self.dispatch_llm_request(turn, None);
     }
@@ -639,6 +654,7 @@ impl App {
             turn.side,
             turn.board,
             turn.candidates.clone(),
+            turn.excluded.clone(),
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -711,7 +727,13 @@ impl App {
                         "大模型落子失败，准备第 {} 次尝试: {error}",
                         self.llm_attempt + 1
                     );
-                    self.dispatch_llm_request(pending.turn, Some(&error));
+                    let mut turn = pending.turn;
+                    if let Some(rejected) = extract_rejected_move(&error) {
+                        if !turn.excluded.contains(&rejected) {
+                            turn.excluded.push(rejected);
+                        }
+                    }
+                    self.dispatch_llm_request(turn, Some(&error));
                 } else {
                     let reason = llm_failure_summary(&error, 30);
                     self.llm_status[pending.turn.profile_index] = format!("Failed: {reason}");
@@ -1050,6 +1072,20 @@ pub(crate) fn llm_failure_summary(error: &str, max_chars: usize) -> String {
     compact_text(&single_line, max_chars)
 }
 
+/// 从"模型返回了候选集外的落点: (x, y)"这类错误中提取模型选中的坐标，
+/// 供重试时排除该位置并提示模型避开。
+fn extract_rejected_move(error: &str) -> Option<(usize, usize)> {
+    if !error.contains("候选集外的落点") {
+        return None;
+    }
+    let digits: Vec<usize> = error
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<usize>().ok())
+        .collect();
+    (digits.len() == 2).then(|| (digits[0], digits[1]))
+}
+
 #[cfg(test)]
 mod worker_tests {
     use super::*;
@@ -1084,6 +1120,7 @@ mod worker_tests {
                 Cell::White,
                 [[Cell::Empty; crate::game::BOARD]; crate::game::BOARD],
                 vec![(7, 7)],
+                Vec::new(),
             )
             .unwrap();
 

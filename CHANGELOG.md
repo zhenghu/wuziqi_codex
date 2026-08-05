@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 云端大模型支持任意 HTTPS OpenAI 兼容服务（DeepSeek、ModelArts 等），不再局限于 OpenRouter 域名
+- 新增 `no_reasoning` 配置项，对推理模型发送 `thinking: {"type":"disabled"}`，避免复杂局面下推理耗尽 token 导致答案为空；配置页面提供对应勾选框
+- 大模型落点失败重试时排除模型选错的位置并在提示词中告知模型避开，提升不稳定模型的成功率
+
+### 改进
+
+- `openrouter.rs` 重构为通用 `cloud.rs`，统一使用标准 OpenAI 兼容请求格式（`max_tokens`，不带 OpenRouter 专属 `reasoning` 字段）
+- 落点解析支持带解释文字、Markdown 代码块、中文标点和多候选讨论等常见模型返回格式
+
 ## [1.0.0] - 2026-07-30
 
 ### 新增

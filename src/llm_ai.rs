@@ -1,7 +1,7 @@
 //! 大模型共享配置、提示词、响应解析与后端分发。
 
+mod cloud;
 mod local;
-mod openrouter;
 
 use crate::game::{BOARD, Cell};
 use serde::{Deserialize, Serialize};
@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 const CONFIG_FILE_NAME: &str = "llm_config.json";
 const SETTINGS_SCHEMA_VERSION: u32 = 2;
 const MAX_LLM_PROFILES: usize = 2;
-pub(crate) const DEFAULT_OPENROUTER_API_URL: &str = openrouter::DEFAULT_API_URL;
-pub(crate) const DEFAULT_OPENROUTER_MODEL: &str = openrouter::DEFAULT_MODEL;
+pub(crate) const DEFAULT_CLOUD_API_URL: &str = cloud::DEFAULT_API_URL;
+pub(crate) const DEFAULT_CLOUD_MODEL: &str = cloud::DEFAULT_MODEL;
 pub(crate) const DEFAULT_LOCAL_API_URL: &str = local::DEFAULT_API_URL;
 pub(crate) const DEFAULT_LOCAL_MODEL: &str = local::DEFAULT_MODEL;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -202,14 +202,14 @@ impl LlmBackend {
 
     pub(crate) fn default_api_url(self) -> &'static str {
         match self {
-            Self::OpenRouter => DEFAULT_OPENROUTER_API_URL,
+            Self::OpenRouter => DEFAULT_CLOUD_API_URL,
             Self::Local => DEFAULT_LOCAL_API_URL,
         }
     }
 
     pub(crate) fn default_model(self) -> &'static str {
         match self {
-            Self::OpenRouter => DEFAULT_OPENROUTER_MODEL,
+            Self::OpenRouter => DEFAULT_CLOUD_MODEL,
             Self::Local => DEFAULT_LOCAL_MODEL,
         }
     }
@@ -227,6 +227,14 @@ pub(crate) struct LlmConfig {
     api_key: String,
     api_url: String,
     model: String,
+    /// 推理模型（如 DeepSeek 的 reasoning 系列）在复杂局面会消耗大量 token
+    /// 思考，导致最终答案为空。开启后在请求中发送 `thinking: {"type":"disabled"}`。
+    #[serde(default, skip_serializing_if = "is_false")]
+    no_reasoning: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -306,7 +314,7 @@ impl LlmConfig {
 
         match backend {
             LlmBackend::OpenRouter => {
-                openrouter::validate_url(&parsed).map_err(ConfigError::Invalid)?;
+                cloud::validate_url(&parsed).map_err(ConfigError::Invalid)?;
             }
             LlmBackend::Local => {
                 local::validate_url(&parsed).map_err(ConfigError::Invalid)?;
@@ -320,6 +328,7 @@ impl LlmConfig {
             api_key,
             api_url,
             model,
+            no_reasoning: false,
         })
     }
 
@@ -335,7 +344,18 @@ impl LlmConfig {
             api_key,
             api_url,
             model,
+            no_reasoning: false,
         }
+    }
+
+    /// 关闭推理模型的思考过程（发送 `thinking: {"type":"disabled"}`）。
+    pub(crate) fn no_reasoning(mut self, enabled: bool) -> Self {
+        self.no_reasoning = enabled;
+        self
+    }
+
+    pub(crate) fn no_reasoning_enabled(&self) -> bool {
+        self.no_reasoning
     }
 
     pub(crate) fn api_key(&self) -> &str {
@@ -694,14 +714,40 @@ fn error_detail(text: &str) -> String {
     }
 }
 
+/// 从模型回复中提取落点坐标。推理模型常在 JSON 前后附带解释文字，
+/// 因此按多种格式逐级尝试：整体 JSON、包裹的 JSON、x/y 键值对、括号坐标、恰好两个数字。
 fn parse_move(text: &str) -> Option<(usize, usize)> {
     let trimmed = text.trim();
+
+    // 1. 整体就是一个 JSON 对象
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        let x = value.get("x")?.as_u64()? as usize;
-        let y = value.get("y")?.as_u64()? as usize;
+        if let Some(move_point) = xy_from_value(&value) {
+            return Some(move_point);
+        }
+    }
+
+    // 2. 文本中包裹的 JSON 对象（前后可能有解释文字或 Markdown 代码块）
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start < end {
+            if let Ok(value) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
+                if let Some(move_point) = xy_from_value(&value) {
+                    return Some(move_point);
+                }
+            }
+        }
+    }
+
+    // 3. "x": N 与 "y": N 键值对（顺序无关，支持中文冒号）
+    if let (Some(x), Some(y)) = (number_after_key(trimmed, "x"), number_after_key(trimmed, "y")) {
         return Some((x, y));
     }
 
+    // 4. (x, y) 括号坐标（支持中文逗号与空格）
+    if let Some(move_point) = number_pair_in_parens(trimmed) {
+        return Some(move_point);
+    }
+
+    // 5. 兜底：文本中恰好出现两个数字
     let values: Vec<_> = trimmed
         .split(|c: char| !c.is_ascii_digit())
         .filter(|part| !part.is_empty())
@@ -710,12 +756,63 @@ fn parse_move(text: &str) -> Option<(usize, usize)> {
     (values.len() == 2).then(|| (values[0], values[1]))
 }
 
+fn xy_from_value(value: &Value) -> Option<(usize, usize)> {
+    let x = value.get("x")?.as_u64()? as usize;
+    let y = value.get("y")?.as_u64()? as usize;
+    Some((x, y))
+}
+
+/// 提取形如 `"x": 7` 的键值对数字，支持中文冒号与空格。
+fn number_after_key(text: &str, key: &str) -> Option<usize> {
+    let needle = format!("\"{key}\"");
+    let rest = &text[text.find(&needle)? + needle.len()..];
+    let rest = rest.trim_start_matches([':', '：', ' ', '\t', '\n', '\r']);
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// 提取形如 `(7, 7)` 或 `（7，7）` 的括号坐标对，支持中文逗号与空格。
+/// 模型可能在讨论多个候选点后给出结论，因此返回最后一个坐标对。
+fn number_pair_in_parens(text: &str) -> Option<(usize, usize)> {
+    let mut last_match: Option<(usize, usize)> = None;
+    for (index, character) in text.char_indices() {
+        if character != '(' && character != '（' {
+            continue;
+        }
+        let after = &text[index + character.len_utf8()..];
+        let x_digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if x_digits.is_empty() {
+            continue;
+        }
+        let Some(x) = x_digits.parse::<usize>().ok() else {
+            continue;
+        };
+        let rest = after[x_digits.len()..].trim_start_matches(&[' ', ',', '，', '\t'][..]);
+        let y_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if y_digits.is_empty() {
+            continue;
+        }
+        let Some(y) = y_digits.parse::<usize>().ok() else {
+            continue;
+        };
+        let rest = rest[y_digits.len()..].trim_start_matches(&[' ', '\t'][..]);
+        if rest.starts_with(')') || rest.starts_with('）') {
+            last_match = Some((x, y));
+        }
+    }
+    last_match
+}
+
 pub(crate) async fn request_move(
     client: &reqwest::Client,
     config: &LlmConfig,
     board: &[[Cell; BOARD]; BOARD],
     side: Cell,
     candidates: &[(usize, usize)],
+    excluded: &[(usize, usize)],
 ) -> Result<LlmMove, String> {
     let (side_name, side_stone, opponent_name, opponent_stone) = match side {
         Cell::Black => ("黑", 'X', "白", 'O'),
@@ -726,7 +823,7 @@ pub(crate) async fn request_move(
         return Err("没有合法候选点".to_string());
     }
 
-    let prompt = format!(
+    let mut prompt = format!(
         "你执{side_name}棋 {side_stone}，对手执{opponent_name}棋 {opponent_stone}，当前轮到你落子。\
          坐标从 0 到 14，格式为 (x,y)，左上角是 (0,0)。\n\
          当前棋盘（每行对应 y=0..14）：\n{}\n\
@@ -735,6 +832,11 @@ pub(crate) async fn request_move(
         board_text(board),
         candidates
     );
+    if !excluded.is_empty() {
+        prompt.push_str(&format!(
+            "\n注意：以下位置已被占据或不可用，绝不能选择它们：{excluded:?}"
+        ));
+    }
     let messages = [
         ChatMessage {
             role: "system",
@@ -749,11 +851,12 @@ pub(crate) async fn request_move(
     ];
     let response = match config.backend {
         LlmBackend::OpenRouter => {
-            openrouter::send_request(
+            cloud::send_request(
                 client,
                 &config.api_url,
                 &config.api_key,
                 &config.model,
+                config.no_reasoning,
                 &messages,
             )
             .await?
@@ -811,7 +914,7 @@ pub(crate) async fn request_move(
         return Err(format!("模型返回了候选集外的落点: {chosen:?}"));
     }
     let (model, provider) = match config.backend {
-        LlmBackend::OpenRouter => openrouter::resolve_route(&value)?,
+        LlmBackend::OpenRouter => cloud::resolve_route(&value, &config.model),
         LlmBackend::Local => local::resolve_route(&value, &config.model),
     };
     Ok(LlmMove {
@@ -821,8 +924,8 @@ pub(crate) async fn request_move(
     })
 }
 
-pub(crate) fn build_openrouter_client() -> Result<reqwest::Client, String> {
-    openrouter::build_client()
+pub(crate) fn build_cloud_client() -> Result<reqwest::Client, String> {
+    cloud::build_client()
 }
 
 pub(crate) fn build_local_client() -> Result<reqwest::Client, String> {

@@ -40,7 +40,9 @@ cargo run --release
 
 ### 大模型 AI（原生版）
 
-大模型模式支持 OpenRouter 和本地 OpenAI-compatible 服务。点击顶部 `Config (C)` 或按 `C` 打开配置页面；普通模式使用 `Primary` / `Add` 管理配置，擂台设置则以 `Black` / `White` 标识当前棋色。普通人机模式可以只保存一份配置，进入擂台时必须保存两份。OpenRouter 后端需要 API Key，且只接受 OpenRouter 官方 HTTPS 端点；本地后端默认连接 Ollama，也兼容提供 `/v1/chat/completions` 的 LM Studio 和 llama.cpp。
+大模型模式支持任意 HTTPS 的 OpenAI-compatible 服务（包括 OpenRouter、DeepSeek、ModelArts 等）和本地服务。点击顶部 `Config (C)` 或按 `C` 打开配置页面；普通模式使用 `Primary` / `Add` 管理配置，擂台设置则以 `Black` / `White` 标识当前棋色。普通人机模式可以只保存一份配置，进入擂台时必须保存两份。云端后端需要 API Key 且必须使用 HTTPS，`api_url` 需要填完整的端点地址（如 `https://openrouter.ai/api/v1/chat/completions` 或 `https://api.deepseek.com/chat/completions`），应用会按配置原样发送请求。本地后端默认连接 Ollama，也兼容提供 `/v1/chat/completions` 的 LM Studio 和 llama.cpp。
+
+推理模型（如 DeepSeek 的 reasoning 系列、`deepseek-v4-flash`）在复杂局面会把大量 token 消耗在思考过程，导致最终答案为空而报"无法解析落点"。此时在 profile 中加 `"no_reasoning": true`，应用会发送 `thinking: {"type":"disabled"}` 关闭推理；也可以改用非推理模型（如 `deepseek-chat`）。该字段为可选，未配置时保持标准 OpenAI 兼容请求，不发送任何推理相关参数。
 
 为避免云端密钥泄露，本地后端只接受 `http` 或 `https` 的数字回环地址（`127.0.0.1` 或 `::1`，不接受 `localhost`），并且请求本地服务时不会发送 OpenRouter API Key。配置保存在系统用户配置目录，并在 macOS/Linux 上设置为仅当前用户可读写。
 
@@ -134,7 +136,7 @@ ollama pull qwen3:4b
 │   ├── llm_ai.rs           # 大模型共享配置、提示词与结果校验
 │   ├── test_support.rs      # Rust 测试共享构造器
 │   └── llm_ai/
-│       ├── openrouter.rs   # OpenRouter 请求与响应适配
+│       ├── cloud.rs        # 云端 OpenAI 兼容请求与响应适配（任意 HTTPS API）
 │       └── local.rs        # 本地兼容请求与安全校验
 ├── llm_config.example.json # 大模型配置示例（不含真实 Key）
 ├── ai.js                   # 网页版 AI 搜索

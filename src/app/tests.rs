@@ -18,6 +18,7 @@ struct RequestRecord {
     model: String,
     board: [[Cell; crate::game::BOARD]; crate::game::BOARD],
     candidates: Vec<(usize, usize)>,
+    excluded: Vec<(usize, usize)>,
 }
 
 #[derive(Default)]
@@ -39,6 +40,7 @@ impl LlmRequestWorker for FakeWorker {
         side: Cell,
         board: [[Cell; crate::game::BOARD]; crate::game::BOARD],
         candidates: Vec<(usize, usize)>,
+        excluded: Vec<(usize, usize)>,
     ) -> Result<Receiver<Result<LlmMove, String>>, String> {
         self.state.requests.borrow_mut().push(RequestRecord {
             side,
@@ -47,6 +49,7 @@ impl LlmRequestWorker for FakeWorker {
             model: config.model().to_string(),
             board,
             candidates,
+            excluded,
         });
         let response = self
             .state
@@ -95,7 +98,7 @@ fn arena_settings() -> LlmSettings {
     let black = LlmConfig::new_unchecked(
         LlmBackend::OpenRouter,
         "black-secret".to_string(),
-        crate::llm_ai::DEFAULT_OPENROUTER_API_URL.to_string(),
+        crate::llm_ai::DEFAULT_CLOUD_API_URL.to_string(),
         "black-model".to_string(),
     );
     let white = local_config("white-model", 1234);
@@ -170,6 +173,47 @@ fn llm_retries_twice_before_falling_back() {
     assert!(should_retry_llm(1));
     assert!(should_retry_llm(2));
     assert!(!should_retry_llm(3));
+}
+
+#[test]
+fn extracts_rejected_move_only_from_out_of_candidate_errors() {
+    assert_eq!(
+        extract_rejected_move("模型返回了候选集外的落点: (7, 7)"),
+        Some((7, 7))
+    );
+    assert_eq!(
+        extract_rejected_move("模型返回了候选集外的落点: (12, 3)"),
+        Some((12, 3))
+    );
+    assert_eq!(
+        extract_rejected_move("无法解析模型落点: 我选择 x=7 y=7"),
+        None
+    );
+    assert_eq!(extract_rejected_move("Cloud request failed: timeout"), None);
+}
+
+#[test]
+fn retry_accumulates_excluded_rejected_moves() {
+    let (mut app, state) = app_with_fake_worker(
+        Mode::HumanVsAi,
+        single_settings(),
+        [
+            FakeResponse::Error("模型返回了候选集外的落点: (7, 7)".to_string()),
+            FakeResponse::Error("模型返回了候选集外的落点: (7, 6)".to_string()),
+            FakeResponse::Success(LlmMove::new_for_test((7, 5), "m", None)),
+        ],
+    );
+
+    app.update_ai();
+    app.update_ai();
+    app.update_ai();
+    app.update_ai();
+
+    let requests = state.requests.borrow();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].excluded, vec![]);
+    assert_eq!(requests[1].excluded, vec![(7, 7)]);
+    assert_eq!(requests[2].excluded, vec![(7, 7), (7, 6)]);
 }
 
 #[test]
