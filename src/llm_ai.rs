@@ -16,7 +16,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 const CONFIG_FILE_NAME: &str = "llm_config.json";
-const SETTINGS_SCHEMA_VERSION: u32 = 2;
+const LEGACY_SETTINGS_SCHEMA_VERSION: u32 = 2;
+const SETTINGS_SCHEMA_VERSION: u32 = 3;
 const MAX_LLM_PROFILES: usize = 2;
 pub(crate) const DEFAULT_CLOUD_API_URL: &str = cloud::DEFAULT_API_URL;
 pub(crate) const DEFAULT_CLOUD_MODEL: &str = cloud::DEFAULT_MODEL;
@@ -24,6 +25,8 @@ pub(crate) const DEFAULT_LOCAL_API_URL: &str = local::DEFAULT_API_URL;
 pub(crate) const DEFAULT_LOCAL_MODEL: &str = local::DEFAULT_MODEL;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_ERROR_TEXT_CHARS: usize = 512;
+pub(crate) const CLOUD_KEY_ORIGIN_CHANGED: &str =
+    "Cloud API origin changed; re-enter the Cloud API Key";
 
 #[derive(Debug)]
 pub(crate) enum ConfigError {
@@ -195,7 +198,7 @@ pub(crate) enum LlmBackend {
 impl LlmBackend {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::OpenRouter => "OpenRouter",
+            Self::OpenRouter => "Cloud",
             Self::Local => "Local",
         }
     }
@@ -225,6 +228,8 @@ pub(crate) struct LlmConfig {
     backend: LlmBackend,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_key_origin: Option<String>,
     api_url: String,
     model: String,
     /// 推理模型（如 DeepSeek 的 reasoning 系列）在复杂局面会消耗大量 token
@@ -293,7 +298,7 @@ impl LlmConfig {
         let model = model.trim().to_string();
         if backend.requires_api_key() && api_key.is_empty() {
             return Err(ConfigError::Invalid(
-                "OpenRouter API Key is required".to_string(),
+                "Cloud API Key is required".to_string(),
             ));
         }
         if model.is_empty() {
@@ -312,20 +317,23 @@ impl LlmConfig {
             ));
         }
 
-        match backend {
+        let api_key_origin = match backend {
             LlmBackend::OpenRouter => {
                 cloud::validate_url(&parsed).map_err(ConfigError::Invalid)?;
+                Some(parsed.origin().ascii_serialization())
             }
             LlmBackend::Local => {
                 local::validate_url(&parsed).map_err(ConfigError::Invalid)?;
                 // A cloud credential must never be retained or sent while the
                 // local transport is selected.
                 api_key.clear();
+                None
             }
-        }
+        };
         Ok(Self {
             backend,
             api_key,
+            api_key_origin,
             api_url,
             model,
             no_reasoning: false,
@@ -339,9 +347,15 @@ impl LlmConfig {
         api_url: String,
         model: String,
     ) -> Self {
+        let api_key_origin = backend.requires_api_key().then(|| {
+            reqwest::Url::parse(&api_url)
+                .ok()
+                .map(|url| url.origin().ascii_serialization())
+        });
         Self {
             backend,
             api_key,
+            api_key_origin: api_key_origin.flatten(),
             api_url,
             model,
             no_reasoning: false,
@@ -362,6 +376,10 @@ impl LlmConfig {
         &self.api_key
     }
 
+    pub(crate) fn api_key_origin(&self) -> Option<&str> {
+        self.api_key_origin.as_deref()
+    }
+
     pub(crate) fn backend(&self) -> LlmBackend {
         self.backend
     }
@@ -372,6 +390,19 @@ impl LlmConfig {
 
     pub(crate) fn model(&self) -> &str {
         &self.model
+    }
+
+    fn validate_cloud_key_origin(&self) -> Result<(), String> {
+        if !self.backend.requires_api_key() {
+            return Ok(());
+        }
+        let parsed = reqwest::Url::parse(&self.api_url)
+            .map_err(|error| format!("Invalid API URL: {error}"))?;
+        let current_origin = parsed.origin().ascii_serialization();
+        if self.api_key_origin.as_deref() != Some(current_origin.as_str()) {
+            return Err(CLOUD_KEY_ORIGIN_CHANGED.to_string());
+        }
+        Ok(())
     }
 }
 
@@ -397,6 +428,14 @@ impl LlmProfile {
 
 impl LlmSettings {
     pub(crate) fn new(profiles: Vec<LlmProfile>, active_profile: usize) -> ConfigResult<Self> {
+        Self::new_with_origin_policy(profiles, active_profile, false)
+    }
+
+    fn new_with_origin_policy(
+        profiles: Vec<LlmProfile>,
+        active_profile: usize,
+        allow_missing_cloud_origin: bool,
+    ) -> ConfigResult<Self> {
         if profiles.is_empty() {
             return Err(ConfigError::Invalid(
                 "At least one LLM profile is required".to_string(),
@@ -415,7 +454,7 @@ impl LlmSettings {
 
         let mut normalized = Vec::with_capacity(profiles.len());
         for profile in profiles {
-            let config = normalize_config(profile.config)?;
+            let config = normalize_config(profile.config, allow_missing_cloud_origin)?;
             let profile = LlmProfile::new(profile.name, config)?;
             if normalized
                 .iter()
@@ -529,7 +568,7 @@ impl LlmSettings {
                 "Unsupported future LLM configuration schema version {version}"
             )));
         }
-        if version != u64::from(SETTINGS_SCHEMA_VERSION) {
+        if version < u64::from(LEGACY_SETTINGS_SCHEMA_VERSION) {
             return Err(ConfigError::Invalid(format!(
                 "Unsupported LLM configuration schema version {version}"
             )));
@@ -559,8 +598,13 @@ impl LlmSettings {
             .iter()
             .map(|profile| profile.config.clone())
             .collect::<Vec<_>>();
-        let settings = Self::new(raw.profiles, raw.active_profile)?;
-        let changed = backend_was_missing
+        let settings = Self::new_with_origin_policy(
+            raw.profiles,
+            raw.active_profile,
+            version == u64::from(LEGACY_SETTINGS_SCHEMA_VERSION),
+        )?;
+        let changed = version != u64::from(SETTINGS_SCHEMA_VERSION)
+            || backend_was_missing
             || active_profile_was_missing
             || settings
                 .profiles
@@ -570,8 +614,10 @@ impl LlmSettings {
                     profile.name.as_str() != raw_name.as_str()
                         || profile.config.backend != raw_config.backend
                         || profile.config.api_key != raw_config.api_key
+                        || profile.config.api_key_origin != raw_config.api_key_origin
                         || profile.config.api_url != raw_config.api_url
                         || profile.config.model != raw_config.model
+                        || profile.config.no_reasoning != raw_config.no_reasoning
                 });
         Ok((settings, changed))
     }
@@ -581,7 +627,7 @@ impl LlmSettings {
             path: path.to_path_buf(),
             source,
         })?;
-        let config = normalize_config(raw)?;
+        let config = normalize_config(raw, true)?;
         let profile = LlmProfile::new(config.model().to_string(), config)?;
         Ok((Self::new(vec![profile], 0)?, true))
     }
@@ -595,9 +641,42 @@ impl LlmSettings {
     }
 }
 
-fn normalize_config(raw: LlmConfig) -> ConfigResult<LlmConfig> {
+fn normalize_config(raw: LlmConfig, allow_missing_cloud_origin: bool) -> ConfigResult<LlmConfig> {
     let repaired_key = repair_paste_artifact(&raw.api_key);
-    LlmConfig::new(raw.backend, repaired_key, raw.api_url, raw.model)
+    let bound_origin = if raw.backend.requires_api_key() {
+        raw.api_key_origin
+            .as_deref()
+            .map(canonical_api_origin)
+            .transpose()?
+    } else {
+        None
+    };
+    let config = LlmConfig::new(raw.backend, repaired_key, raw.api_url, raw.model)?;
+    if config.backend.requires_api_key() {
+        if let Some(bound_origin) = bound_origin {
+            if config.api_key_origin.as_deref() != Some(bound_origin.as_str()) {
+                return Err(ConfigError::Invalid(CLOUD_KEY_ORIGIN_CHANGED.to_string()));
+            }
+        } else if !allow_missing_cloud_origin {
+            return Err(ConfigError::Invalid(CLOUD_KEY_ORIGIN_CHANGED.to_string()));
+        }
+    }
+    Ok(config.no_reasoning(raw.no_reasoning))
+}
+
+fn canonical_api_origin(value: &str) -> ConfigResult<String> {
+    let parsed = reqwest::Url::parse(value.trim())
+        .map_err(|_| ConfigError::Invalid(CLOUD_KEY_ORIGIN_CHANGED.to_string()))?;
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return Err(ConfigError::Invalid(CLOUD_KEY_ORIGIN_CHANGED.to_string()));
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 fn write_json_atomically(value: &impl Serialize, path: &Path) -> ConfigResult<()> {
@@ -715,70 +794,310 @@ fn error_detail(text: &str) -> String {
 }
 
 /// 从模型回复中提取落点坐标。推理模型常在 JSON 前后附带解释文字，
-/// 因此按多种格式逐级尝试：整体 JSON、包裹的 JSON、x/y 键值对、括号坐标、恰好两个数字。
+/// 因此收集 JSON、x/y 键值对和括号坐标，并采用文本中最后一个明确坐标。
 fn parse_move(text: &str) -> Option<(usize, usize)> {
     let trimmed = text.trim();
 
-    // 1. 整体就是一个 JSON 对象
+    // 整体就是一个 JSON 对象时直接解析。
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         if let Some(move_point) = xy_from_value(&value) {
             return Some(move_point);
         }
     }
 
-    // 2. 文本中包裹的 JSON 对象（前后可能有解释文字或 Markdown 代码块）
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if start < end {
-            if let Ok(value) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
-                if let Some(move_point) = xy_from_value(&value) {
-                    return Some(move_point);
-                }
-            }
-        }
+    let mut last_explicit = last_json_move(trimmed)?;
+
+    // 也接受不在对象中的成对 x/y 键值；对象内部由 last_json_move 隔离处理，
+    // 避免把不同候选或 metadata 中的单个键拼成一个坐标。
+    if let Some(move_point) = last_keyed_move_at_depth(trimmed, 0) {
+        keep_later_move(&mut last_explicit, move_point);
     }
 
-    // 3. "x": N 与 "y": N 键值对（顺序无关，支持中文冒号）
-    if let (Some(x), Some(y)) = (number_after_key(trimmed, "x"), number_after_key(trimmed, "y")) {
-        return Some((x, y));
+    if let Some(move_point) = last_number_pair_in_parens(trimmed) {
+        keep_later_move(&mut last_explicit, move_point);
     }
 
-    // 4. (x, y) 括号坐标（支持中文逗号与空格）
-    if let Some(move_point) = number_pair_in_parens(trimmed) {
+    if let Some((_, move_point)) = last_explicit {
         return Some(move_point);
     }
 
-    // 5. 兜底：文本中恰好出现两个数字
-    let values: Vec<_> = trimmed
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| part.parse::<usize>().ok())
-        .collect();
-    (values.len() == 2).then(|| (values[0], values[1]))
+    // JSON 包装对象中只有 metadata 坐标时不能把其中的两个数字当成最终落点。
+    if trimmed.contains('{') || trimmed.contains('}') {
+        return None;
+    }
+
+    // 兜底：文本中恰好出现两个数字。
+    exactly_two_plain_integers(trimmed)
+}
+
+fn keep_later_move(
+    current: &mut Option<(usize, (usize, usize))>,
+    candidate: (usize, (usize, usize)),
+) {
+    if current.is_none_or(|(index, _)| candidate.0 >= index) {
+        *current = Some(candidate);
+    }
+}
+
+/// 仅扫描文本中的最外层对象，返回结束位置最靠后的有效坐标。
+/// 标准 JSON 只读取对象顶层的 x/y；非标准 JSON（例如中文冒号）则在
+/// 同一个最外层对象中成对读取，避免嵌套 metadata 或残缺候选互相混配。
+fn last_json_move(text: &str) -> Option<Option<(usize, (usize, usize))>> {
+    let mut object_start = None;
+    let mut object_depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut last_match = None;
+
+    for (index, character) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match character {
+            '"' => in_string = true,
+            '{' => {
+                if object_depth == 0 {
+                    object_start = Some(index);
+                }
+                object_depth += 1;
+            }
+            '}' if object_depth > 0 => {
+                object_depth -= 1;
+                if object_depth != 0 {
+                    continue;
+                }
+                let Some(start) = object_start.take() else {
+                    continue;
+                };
+                let end = index + character.len_utf8();
+                let object = &text[start..end];
+                let move_point = serde_json::from_str::<Value>(object)
+                    .ok()
+                    .and_then(|value| xy_from_value(&value))
+                    .or_else(|| last_keyed_move_at_depth(object, 1).map(|(_, point)| point));
+                if let Some(move_point) = move_point {
+                    keep_later_move(&mut last_match, (end, move_point));
+                }
+            }
+            _ => {}
+        }
+    }
+    (object_depth == 0).then_some(last_match)
 }
 
 fn xy_from_value(value: &Value) -> Option<(usize, usize)> {
-    let x = value.get("x")?.as_u64()? as usize;
-    let y = value.get("y")?.as_u64()? as usize;
+    let x = usize::try_from(value.get("x")?.as_u64()?).ok()?;
+    let y = usize::try_from(value.get("y")?.as_u64()?).ok()?;
     Some((x, y))
 }
 
-/// 提取形如 `"x": 7` 的键值对数字，支持中文冒号与空格。
-fn number_after_key(text: &str, key: &str) -> Option<usize> {
-    let needle = format!("\"{key}\"");
-    let rest = &text[text.find(&needle)? + needle.len()..];
-    let rest = rest.trim_start_matches([':', '：', ' ', '\t', '\n', '\r']);
-    let digits: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
+#[derive(Clone, Copy)]
+enum CoordinateKey {
+    X,
+    Y,
+}
+
+/// 在指定对象深度收集键值，并且只有同一次扫描中完整出现一对 x/y 才产出候选。
+/// 每产出一对后立即清空状态，因此后续残缺的 x 或 y 不会与上一候选混配。
+fn last_keyed_move_at_depth(text: &str, target_depth: usize) -> Option<(usize, (usize, usize))> {
+    let mut object_depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut pending_x = None;
+    let mut pending_y = None;
+    let mut last_match = None;
+
+    for (index, character) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match character {
+            '"' => {
+                if object_depth == target_depth {
+                    if let Some((key, value)) = keyed_number(&text[index..]) {
+                        match key {
+                            CoordinateKey::X => pending_x = Some((index, value)),
+                            CoordinateKey::Y => pending_y = Some((index, value)),
+                        }
+                        if let (Some((x_index, x)), Some((y_index, y))) = (pending_x, pending_y) {
+                            last_match = Some((x_index.max(y_index), (x, y)));
+                            pending_x = None;
+                            pending_y = None;
+                        }
+                    }
+                }
+                in_string = true;
+            }
+            '{' => {
+                if object_depth == target_depth {
+                    pending_x = None;
+                    pending_y = None;
+                }
+                object_depth += 1;
+            }
+            '}' => {
+                object_depth = object_depth.saturating_sub(1);
+                if object_depth == target_depth {
+                    pending_x = None;
+                    pending_y = None;
+                }
+            }
+            'x' | 'y' if object_depth == target_depth => {
+                if let Some((key, value)) = keyed_number(&text[index..]) {
+                    match key {
+                        CoordinateKey::X => pending_x = Some((index, value)),
+                        CoordinateKey::Y => pending_y = Some((index, value)),
+                    }
+                    if let (Some((x_index, x)), Some((y_index, y))) = (pending_x, pending_y) {
+                        last_match = Some((x_index.max(y_index), (x, y)));
+                        pending_x = None;
+                        pending_y = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    last_match
+}
+
+fn keyed_number(text: &str) -> Option<(CoordinateKey, usize)> {
+    let (key, rest) = if let Some(rest) = text.strip_prefix("\"x\"") {
+        (CoordinateKey::X, rest)
+    } else if let Some(rest) = text.strip_prefix("\"y\"") {
+        (CoordinateKey::Y, rest)
+    } else if let Some(rest) = text.strip_prefix('x') {
+        (CoordinateKey::X, rest)
+    } else {
+        (CoordinateKey::Y, text.strip_prefix('y')?)
+    };
+    let rest = rest.trim_start_matches([' ', '\t', '\n', '\r']);
+    let rest = rest
+        .strip_prefix(':')
+        .or_else(|| rest.strip_prefix('：'))?
+        .trim_start_matches([' ', '\t', '\n', '\r']);
+    Some((key, coordinate_integer(rest)?))
+}
+
+/// 解析一个完整的非负十进制整数；允许 JSON 数字字符串，但拒绝把
+/// 小数、科学计数或负数的整数前缀误当成坐标。
+fn coordinate_integer(text: &str) -> Option<usize> {
+    let (number, tail) = if let Some(quoted) = text.strip_prefix('"') {
+        let digit_bytes = quoted
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .count();
+        if digit_bytes == 0 {
+            return None;
+        }
+        let tail = &quoted[digit_bytes..];
+        let tail = tail.strip_prefix('"')?;
+        (&quoted[..digit_bytes], tail)
+    } else {
+        let digit_bytes = text
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .count();
+        if digit_bytes == 0 {
+            return None;
+        }
+        (&text[..digit_bytes], &text[digit_bytes..])
+    };
+
+    if let Some(next) = tail.chars().next() {
+        let boundary = next.is_whitespace()
+            || matches!(next, ',' | '，' | '}' | ']' | ';' | '；' | ')' | '）');
+        if !boundary {
+            return None;
+        }
+    }
+    number.parse().ok()
+}
+
+fn exactly_two_plain_integers(text: &str) -> Option<(usize, usize)> {
+    let mut values = Vec::new();
+    let mut characters = text.char_indices().peekable();
+
+    while let Some((start, character)) = characters.next() {
+        if !character.is_ascii_digit() {
+            continue;
+        }
+        let mut end = start + character.len_utf8();
+        while let Some(&(index, next)) = characters.peek() {
+            if !next.is_ascii_digit() {
+                break;
+            }
+            characters.next();
+            end = index + next.len_utf8();
+        }
+
+        let before = text[..start].chars().next_back();
+        let after = text[end..].chars().next();
+        if before.is_some_and(|value| {
+            matches!(value, '-' | '+' | '−' | '.') || value.is_ascii_alphanumeric()
+        }) || after.is_some_and(|value| value == '.' || matches!(value, 'e' | 'E'))
+        {
+            return None;
+        }
+
+        values.push(text[start..end].parse::<usize>().ok()?);
+    }
+
+    (values.len() == 2).then(|| (values[0], values[1]))
 }
 
 /// 提取形如 `(7, 7)` 或 `（7，7）` 的括号坐标对，支持中文逗号与空格。
-/// 模型可能在讨论多个候选点后给出结论，因此返回最后一个坐标对。
-fn number_pair_in_parens(text: &str) -> Option<(usize, usize)> {
-    let mut last_match: Option<(usize, usize)> = None;
+/// 模型可能在讨论多个候选点后给出结论，因此返回最后一个坐标及其位置。
+fn last_number_pair_in_parens(text: &str) -> Option<(usize, (usize, usize))> {
+    let mut last_match = None;
+    let mut object_depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
     for (index, character) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => {
+                in_string = true;
+                continue;
+            }
+            '{' => {
+                object_depth += 1;
+                continue;
+            }
+            '}' => {
+                object_depth = object_depth.saturating_sub(1);
+                continue;
+            }
+            _ => {}
+        }
+        if object_depth != 0 {
+            continue;
+        }
         if character != '(' && character != '（' {
             continue;
         }
@@ -800,7 +1119,7 @@ fn number_pair_in_parens(text: &str) -> Option<(usize, usize)> {
         };
         let rest = rest[y_digits.len()..].trim_start_matches(&[' ', '\t'][..]);
         if rest.starts_with(')') || rest.starts_with('）') {
-            last_match = Some((x, y));
+            last_match = Some((index, (x, y)));
         }
     }
     last_match
@@ -851,6 +1170,7 @@ pub(crate) async fn request_move(
     ];
     let response = match config.backend {
         LlmBackend::OpenRouter => {
+            config.validate_cloud_key_origin()?;
             cloud::send_request(
                 client,
                 &config.api_url,

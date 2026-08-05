@@ -162,14 +162,38 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(request)
 }
 
+fn request_json_body(request: &str) -> Value {
+    let (_, body) = request
+        .split_once("\r\n\r\n")
+        .expect("captured HTTP request must contain a body");
+    serde_json::from_str(body).expect("captured HTTP request body must be JSON")
+}
+
 fn run_request(config: &LlmConfig, candidates: &[(usize, usize)]) -> Result<LlmMove, String> {
     run_request_for_side(config, Cell::White, candidates)
+}
+
+fn run_request_with_excluded(
+    config: &LlmConfig,
+    candidates: &[(usize, usize)],
+    excluded: &[(usize, usize)],
+) -> Result<LlmMove, String> {
+    run_request_for_side_with_excluded(config, Cell::White, candidates, excluded)
 }
 
 fn run_request_for_side(
     config: &LlmConfig,
     side: Cell,
     candidates: &[(usize, usize)],
+) -> Result<LlmMove, String> {
+    run_request_for_side_with_excluded(config, side, candidates, &[])
+}
+
+fn run_request_for_side_with_excluded(
+    config: &LlmConfig,
+    side: Cell,
+    candidates: &[(usize, usize)],
+    excluded: &[(usize, usize)],
 ) -> Result<LlmMove, String> {
     let client = match config.backend() {
         LlmBackend::OpenRouter => build_cloud_client(),
@@ -186,7 +210,7 @@ fn run_request_for_side(
             &[[Cell::Empty; BOARD]; BOARD],
             side,
             candidates,
-            &[],
+            excluded,
         ))
 }
 
@@ -215,10 +239,7 @@ fn parses_coordinates_surrounded_by_explanatory_text() {
         Some((7, 7))
     );
     // Markdown 代码块包裹
-    assert_eq!(
-        parse_move("```json\n{\"x\":7,\"y\":7}\n```"),
-        Some((7, 7))
-    );
+    assert_eq!(parse_move("```json\n{\"x\":7,\"y\":7}\n```"), Some((7, 7)));
     // JSON 带空格与中文冒号
     assert_eq!(parse_move(r#"答案是 {"x"： 7 ，"y"： 8}"#), Some((7, 8)));
     // 只有 x/y 键值对，无 JSON 整体
@@ -232,6 +253,88 @@ fn parses_coordinates_surrounded_by_explanatory_text() {
     );
     // 数字多于两个且无坐标结构时仍拒绝
     assert_eq!(parse_move("7 8 9 10"), None);
+}
+
+#[test]
+fn parses_the_last_explicit_move_from_multiple_candidates() {
+    assert_eq!(
+        parse_move(r#"先考虑 {"x":5,"y":5}，防守方案 {"x":6,"y":6}，最终 {"x":7,"y":8}"#,),
+        Some((7, 8))
+    );
+    assert_eq!(
+        parse_move(r#"候选 {"x":5,"y":5}，最终选择 (12,3)"#),
+        Some((12, 3))
+    );
+    assert_eq!(
+        parse_move(r#"候选 {"x"： 5 ，"y"： 5}，最终 {"x"： 9 ，"y"： 10}"#),
+        Some((9, 10))
+    );
+    assert_eq!(
+        parse_move(r#"模型结果 {"x":7,"y":8,"metadata":{"x":5,"y":5}} 完毕"#),
+        Some((7, 8))
+    );
+    assert_eq!(
+        parse_move(r#"模型结果 {"x":7,"y":8,"metadata":{"note":"另一个候选 (5,5)"}} 完毕"#,),
+        Some((7, 8))
+    );
+    assert_eq!(
+        parse_move(r#"包装 {"metadata":{"x":5,"y":5}}，最终选择 (9,10)"#),
+        Some((9, 10))
+    );
+    assert_eq!(parse_move(r#"包装 {"metadata":{"x":5,"y":5}}"#), None);
+}
+
+#[test]
+fn incomplete_trailing_candidates_do_not_mix_x_and_y() {
+    assert_eq!(
+        parse_move(r#"候选 {"x":5,"y":6}，最终输出残缺对象 {"x":9}"#),
+        Some((5, 6))
+    );
+    assert_eq!(
+        parse_move(r#"候选 {"x"：5，"y"：6}，最终输出残缺对象 {"x"：9}"#),
+        Some((5, 6))
+    );
+    assert_eq!(
+        parse_move(r#"候选 "x"：5 "y"：6；最终只有 "x"：9"#),
+        Some((5, 6))
+    );
+    assert_eq!(parse_move(r#"残缺 {"x":9}"#), None);
+}
+
+#[test]
+fn keyed_coordinates_do_not_pair_across_json_candidates() {
+    assert_eq!(
+        parse_move(r#"前文 "x":5，中间 {"x":7,"y":8}，后文 "y":6"#),
+        Some((7, 8))
+    );
+}
+
+#[test]
+fn coordinate_numbers_must_be_complete_non_negative_integers() {
+    for invalid in [
+        r#"{"x":7.9,"y":8}"#,
+        r#"{"x":7e1,"y":8}"#,
+        r#"{x:7.9,y:8}"#,
+        r#"{"x":-7,"y":8}"#,
+        "x=-7 y=8",
+        "(-7,8)",
+    ] {
+        assert_eq!(parse_move(invalid), None, "unexpectedly parsed {invalid}");
+    }
+}
+
+#[test]
+fn incomplete_final_json_does_not_fall_back_to_an_earlier_move() {
+    assert_eq!(
+        parse_move(r#"候选 {"x":5,"y":6}，最终 {"x":9,"y":10"#),
+        None
+    );
+}
+
+#[test]
+fn common_approximate_json_coordinates_remain_supported() {
+    assert_eq!(parse_move("{x:7,y:8}"), Some((7, 8)));
+    assert_eq!(parse_move(r#"{"x":"7","y":"8"}"#), Some((7, 8)));
 }
 
 #[test]
@@ -293,6 +396,28 @@ fn white_request_identifies_white_as_o_and_black_as_x() {
 
     assert_eq!(llm_move.position, (7, 7));
     assert!(request.contains("你执白棋 O，对手执黑棋 X，当前轮到你落子"));
+}
+
+#[test]
+fn request_prompt_includes_moves_rejected_by_previous_attempts() {
+    let server = TestServer::new(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"{\"x\":7,\"y\":7}"}}]}"#,
+    );
+    let config = local_test_config(&server);
+
+    let llm_move =
+        run_request_with_excluded(&config, &[(7, 7), (7, 6)], &[(7, 6), (8, 8)]).unwrap();
+    let request = server.finish();
+    let body = request_json_body(&request);
+    let prompt = body
+        .pointer("/messages/1/content")
+        .and_then(Value::as_str)
+        .unwrap();
+
+    assert_eq!(llm_move.position, (7, 7));
+    assert!(prompt.contains("战术引擎给出的合法候选点：[(7, 7), (7, 6)]"));
+    assert!(prompt.contains("以下位置已被占据或不可用，绝不能选择它们：[(7, 6), (8, 8)]"));
 }
 
 #[test]
@@ -410,23 +535,26 @@ fn repairs_only_the_known_cmd_v_paste_artifact() {
 
 #[test]
 fn validates_openrouter_configuration() {
-    assert!(
-        LlmConfig::new(
-            LlmBackend::OpenRouter,
-            "key".into(),
-            DEFAULT_CLOUD_API_URL.into(),
-            "model".into()
-        )
-        .is_ok()
-    );
-    assert!(
+    assert_eq!(LlmBackend::OpenRouter.label(), "Cloud");
+    let config = LlmConfig::new(
+        LlmBackend::OpenRouter,
+        "key".into(),
+        DEFAULT_CLOUD_API_URL.into(),
+        "model".into(),
+    )
+    .unwrap();
+    assert_eq!(config.api_key_origin(), Some("https://openrouter.ai"));
+    assert_eq!(
         LlmConfig::new(
             LlmBackend::OpenRouter,
             "".into(),
             DEFAULT_CLOUD_API_URL.into(),
             "model".into()
         )
-        .is_err()
+        .err()
+        .unwrap()
+        .to_string(),
+        "Cloud API Key is required"
     );
     assert!(
         LlmConfig::new(
@@ -496,6 +624,7 @@ fn local_configuration_accepts_only_numeric_loopback_chat_endpoints() {
         )
         .unwrap();
         assert!(config.api_key().is_empty());
+        assert_eq!(config.api_key_origin(), None);
     }
 
     for url in [
@@ -567,6 +696,23 @@ fn migrates_legacy_configuration_to_the_system_path() {
 }
 
 #[test]
+fn repository_example_loads_through_the_production_normalizer_without_repair() {
+    let root = TestDir::new("example-config");
+    let path = root.join(CONFIG_FILE_NAME);
+    std::fs::write(&path, include_str!("../../llm_config.example.json")).unwrap();
+
+    let (settings, repaired) = LlmSettings::read_from_path(&path).unwrap();
+
+    assert!(!repaired);
+    assert_eq!(settings.profiles().len(), MAX_LLM_PROFILES);
+    assert_eq!(
+        settings.profiles()[0].config().api_key_origin(),
+        Some("https://api.deepseek.com")
+    );
+    assert_eq!(settings.profiles()[1].config().api_key_origin(), None);
+}
+
+#[test]
 fn upgrades_a_current_three_field_configuration_in_place() {
     let root = TestDir::new("schema-upgrade");
     let current = root.join(CONFIG_FILE_NAME);
@@ -588,7 +734,101 @@ fn upgrades_a_current_three_field_configuration_in_place() {
         serde_json::from_str(&std::fs::read_to_string(&current).unwrap()).unwrap();
     assert_eq!(upgraded["schema_version"], SETTINGS_SCHEMA_VERSION);
     assert_eq!(upgraded["profiles"][0]["backend"], "openrouter");
+    assert_eq!(
+        upgraded["profiles"][0]["api_key_origin"],
+        "https://openrouter.ai"
+    );
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn rejects_a_persisted_cloud_key_after_its_api_origin_changes() {
+    let root = TestDir::new("cloud-origin-mismatch");
+    let current = root.join(CONFIG_FILE_NAME);
+    let missing_legacy = root.join("missing").join(CONFIG_FILE_NAME);
+    let original = r#"{
+        "schema_version": 3,
+        "profiles": [{
+            "name": "Cloud",
+            "backend": "openrouter",
+            "api_key": "provider-a-secret",
+            "api_key_origin": "https://provider-a.example",
+            "api_url": "https://provider-b.example/v1/chat/completions",
+            "model": "model"
+        }],
+        "active_profile": 0
+    }"#;
+    std::fs::write(&current, original).unwrap();
+
+    let error = match LlmSettings::load_with_paths(&current, &missing_legacy) {
+        Ok(_) => panic!("a key bound to another Cloud origin must not load"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.to_string(), CLOUD_KEY_ORIGIN_CHANGED);
+    assert_eq!(std::fs::read_to_string(&current).unwrap(), original);
+}
+
+#[test]
+fn current_schema_rejects_a_missing_or_null_cloud_key_origin() {
+    let root = TestDir::new("missing-cloud-origin");
+    for (case, include_null) in [("missing", false), ("null", true)] {
+        let path = root.join(format!("{case}.json"));
+        let mut value = serde_json::json!({
+            "schema_version": SETTINGS_SCHEMA_VERSION,
+            "profiles": [{
+                "name": "Cloud",
+                "backend": "openrouter",
+                "api_key": "provider-secret",
+                "api_url": "https://provider.example/v1/chat/completions",
+                "model": "model"
+            }],
+            "active_profile": 0
+        });
+        if include_null {
+            value["profiles"][0]["api_key_origin"] = Value::Null;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        let error = match LlmSettings::read_from_path(&path) {
+            Ok(_) => panic!("current schema must reject a {case} Cloud key origin"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), CLOUD_KEY_ORIGIN_CHANGED, "{case}");
+    }
+}
+
+#[test]
+fn canonicalizes_an_equivalent_persisted_cloud_origin() {
+    let root = TestDir::new("canonical-cloud-origin");
+    let path = root.join(CONFIG_FILE_NAME);
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{
+                "schema_version": {SETTINGS_SCHEMA_VERSION},
+                "profiles": [{{
+                    "name": "Cloud",
+                    "backend": "openrouter",
+                    "api_key": "provider-secret",
+                    "api_key_origin": "https://PROVIDER.example:443/",
+                    "api_url": "https://provider.example/v1/chat/completions",
+                    "model": "model"
+                }}],
+                "active_profile": 0
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let (settings, changed) = LlmSettings::read_from_path(&path).unwrap();
+
+    assert!(changed);
+    assert_eq!(
+        settings.active_profile().config().api_key_origin(),
+        Some("https://provider.example")
+    );
 }
 
 #[test]
@@ -605,7 +845,8 @@ fn two_profile_settings_round_trip_in_one_versioned_file() {
                     DEFAULT_CLOUD_API_URL.into(),
                     "cloud-model".into(),
                 )
-                .unwrap(),
+                .unwrap()
+                .no_reasoning(true),
             )
             .unwrap(),
             LlmProfile::new(
@@ -625,7 +866,9 @@ fn two_profile_settings_round_trip_in_one_versioned_file() {
     .unwrap();
 
     settings.save_to_path(&path).unwrap();
-    let (loaded, changed) = LlmSettings::read_from_path(&path).unwrap();
+    let missing_legacy = root.join("missing").join(CONFIG_FILE_NAME);
+    let loaded = LlmSettings::load_with_paths(&path, &missing_legacy).unwrap();
+    let (_, changed) = LlmSettings::read_from_path(&path).unwrap();
 
     assert!(!changed);
     assert_eq!(loaded.active_profile_index(), 1);
@@ -633,12 +876,18 @@ fn two_profile_settings_round_trip_in_one_versioned_file() {
     assert_eq!(black.name(), "Cloud");
     assert_eq!(black.config().model(), "cloud-model");
     assert_eq!(black.config().api_key(), "cloud-key");
+    assert!(black.config().no_reasoning_enabled());
     assert_eq!(white.name(), "Local");
     assert_eq!(white.config().model(), "local-model");
     assert!(white.config().api_key().is_empty());
     let json: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(json["schema_version"], SETTINGS_SCHEMA_VERSION);
     assert_eq!(json["profiles"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        json["profiles"][0]["api_key_origin"],
+        "https://openrouter.ai"
+    );
+    assert_eq!(json["profiles"][0]["no_reasoning"], true);
 }
 
 #[test]
@@ -667,6 +916,7 @@ fn missing_active_profile_is_defaulted_and_rewritten() {
     assert_eq!(loaded.active_profile_index(), 0);
     let rewritten: Value =
         serde_json::from_str(&std::fs::read_to_string(&current).unwrap()).unwrap();
+    assert_eq!(rewritten["schema_version"], SETTINGS_SCHEMA_VERSION);
     assert_eq!(rewritten["active_profile"], 0);
 }
 
@@ -707,9 +957,15 @@ fn loading_versioned_settings_scrubs_a_cloud_key_from_a_local_profile() {
 
     assert_eq!(cloud.config().api_key(), "cloud-key");
     assert!(local.config().api_key().is_empty());
-    let rewritten = std::fs::read_to_string(&current).unwrap();
-    assert!(rewritten.contains("cloud-key"));
-    assert!(!rewritten.contains("must-be-removed"));
+    let rewritten_text = std::fs::read_to_string(&current).unwrap();
+    assert!(rewritten_text.contains("cloud-key"));
+    assert!(!rewritten_text.contains("must-be-removed"));
+    let rewritten: Value = serde_json::from_str(&rewritten_text).unwrap();
+    assert_eq!(rewritten["schema_version"], SETTINGS_SCHEMA_VERSION);
+    assert_eq!(
+        rewritten["profiles"][0]["api_key_origin"],
+        "https://openrouter.ai"
+    );
 }
 
 #[test]
@@ -1054,6 +1310,23 @@ fn cloud_api_request_uses_standard_openai_compatible_format() {
 }
 
 #[test]
+fn cloud_request_refuses_to_send_a_key_after_an_in_memory_origin_change() {
+    let mut config = LlmConfig::new(
+        LlmBackend::OpenRouter,
+        "provider-a-secret".into(),
+        "https://provider-a.example/v1/chat/completions".into(),
+        "model".into(),
+    )
+    .unwrap();
+    config.api_url = "https://provider-b.example/v1/chat/completions".into();
+
+    let error = run_request(&config, &[(7, 7)]).unwrap_err();
+
+    assert_eq!(error, CLOUD_KEY_ORIGIN_CHANGED);
+    assert!(!error.contains("provider-a-secret"));
+}
+
+#[test]
 fn deserializes_no_reasoning_from_json() {
     let raw = r#"{
         "schema_version": 2,
@@ -1070,7 +1343,8 @@ fn deserializes_no_reasoning_from_json() {
     let settings: LlmSettings = serde_json::from_str(raw).unwrap();
     assert!(settings.active_profile().config().no_reasoning_enabled());
 
-    let without: LlmSettings = serde_json::from_str(r#"{
+    let without: LlmSettings = serde_json::from_str(
+        r#"{
         "schema_version": 2,
         "profiles": [{
             "name": "test",
@@ -1080,6 +1354,8 @@ fn deserializes_no_reasoning_from_json() {
             "model": "m"
         }],
         "active_profile": 0
-    }"#).unwrap();
+    }"#,
+    )
+    .unwrap();
     assert!(!without.active_profile().config().no_reasoning_enabled());
 }

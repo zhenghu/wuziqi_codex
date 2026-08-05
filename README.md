@@ -40,11 +40,13 @@ cargo run --release
 
 ### 大模型 AI（原生版）
 
-大模型模式支持任意 HTTPS 的 OpenAI-compatible 服务（包括 OpenRouter、DeepSeek、ModelArts 等）和本地服务。点击顶部 `Config (C)` 或按 `C` 打开配置页面；普通模式使用 `Primary` / `Add` 管理配置，擂台设置则以 `Black` / `White` 标识当前棋色。普通人机模式可以只保存一份配置，进入擂台时必须保存两份。云端后端需要 API Key 且必须使用 HTTPS，`api_url` 需要填完整的端点地址（如 `https://openrouter.ai/api/v1/chat/completions` 或 `https://api.deepseek.com/chat/completions`），应用会按配置原样发送请求。本地后端默认连接 Ollama，也兼容提供 `/v1/chat/completions` 的 LM Studio 和 llama.cpp。
+大模型模式支持任意 HTTPS 的 OpenAI-compatible 云服务（包括 OpenRouter、DeepSeek、ModelArts 等）和本地服务。点击顶部 `Config (C)` 或按 `C` 打开配置页面；普通模式使用 `Primary` / `Add` 管理配置，擂台设置则以 `Black` / `White` 标识当前棋色。普通人机模式可以只保存一份配置，进入擂台时必须保存两份，配置文件最多保存两份 profile。`Cloud` 后端需要 API Key 且必须使用 HTTPS，`api_url` 需要填完整的端点地址（如 `https://openrouter.ai/api/v1/chat/completions` 或 `https://api.deepseek.com/chat/completions`），应用会按配置原样发送请求。`Local` 后端默认连接 Ollama，也兼容提供 `/v1/chat/completions` 的 LM Studio 和 llama.cpp。
 
-推理模型（如 DeepSeek 的 reasoning 系列、`deepseek-v4-flash`）在复杂局面会把大量 token 消耗在思考过程，导致最终答案为空而报"无法解析落点"。此时在 profile 中加 `"no_reasoning": true`，应用会发送 `thinking: {"type":"disabled"}` 关闭推理；也可以改用非推理模型（如 `deepseek-chat`）。该字段为可选，未配置时保持标准 OpenAI 兼容请求，不发送任何推理相关参数。
+配置文件中 `Cloud` 后端继续使用 `"backend": "openrouter"` 作为向后兼容的 JSON 标识；它并不限定服务商为 OpenRouter。建议在配置页面切换供应商并重新输入该服务商的 API Key、完整 HTTPS 端点和模型 ID。为避免把密钥发送给另一个服务商，Cloud API Key 会绑定到 API URL 的 origin（协议、主机和端口），仅修改同一 origin 下的路径不需要重输。v2 配置会自动迁移到 v3；v3 的 Cloud profile 必须保留应用维护的 `api_key_origin`。若手工创建 JSON，该字段必须与 `api_url` 的 origin 一致；现有配置的绑定不匹配时应用会拒绝加载，请恢复原配置或重新创建该 profile，不要把旧绑定复制到新服务商配置。
 
-为避免云端密钥泄露，本地后端只接受 `http` 或 `https` 的数字回环地址（`127.0.0.1` 或 `::1`，不接受 `localhost`），并且请求本地服务时不会发送 OpenRouter API Key。配置保存在系统用户配置目录，并在 macOS/Linux 上设置为仅当前用户可读写。
+推理模型（如 DeepSeek 的 reasoning 系列、`deepseek-v4-flash`）在复杂局面会把大量 token 消耗在思考过程，导致最终答案为空而报"无法解析落点"。使用示例中的 `deepseek-v4-flash` 时应保留 `"no_reasoning": true`，应用会发送 `thinking: {"type":"disabled"}` 关闭推理。该字段为可选，未配置时保持标准 OpenAI 兼容请求，不发送任何推理相关参数。
+
+为避免云端密钥泄露，`Local` 后端只接受 `http` 或 `https` 的数字回环地址（`127.0.0.1` 或 `::1`，不接受 `localhost`），并且请求本地服务时不会发送云端 API Key。配置保存在系统用户配置目录，并在 macOS/Linux 上设置为仅当前用户可读写。
 
 macOS 配置路径为 `~/Library/Application Support/Wuziqi/llm_config.json`。旧版项目目录中的 `llm_config.json` 会在首次启动时自动迁移到新位置，并归档为 `llm_config.json.migrated`，避免误删原文件。也可以复制示例文件后直接编辑 JSON：
 
@@ -56,14 +58,16 @@ cargo run --release
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "profiles": [
     {
-      "name": "GPT-5 mini",
+      "name": "DeepSeek Cloud",
       "backend": "openrouter",
-      "api_key": "YOUR_OPENROUTER_API_KEY",
-      "api_url": "https://openrouter.ai/api/v1/chat/completions",
-      "model": "openai/gpt-5-mini"
+      "api_key": "YOUR_DEEPSEEK_API_KEY",
+      "api_key_origin": "https://api.deepseek.com",
+      "api_url": "https://api.deepseek.com/chat/completions",
+      "model": "deepseek-v4-flash",
+      "no_reasoning": true
     },
     {
       "name": "Qwen Local",
@@ -76,7 +80,7 @@ cargo run --release
 }
 ```
 
-仓库中的 `llm_config.example.json` 不包含真实密钥。两份 profile 会通过一次原子替换共同保存，旧版单配置会自动迁移为一个 profile，不会擅自复制成第二名选手。配置页面支持 API Key 脱敏显示、显示/隐藏、`Paste` 按钮、`Cmd/Ctrl+V` 粘贴和保存前校验。请求超时、服务报错或模型返回非法坐标时，最多自动尝试 3 次；人机模式随后降级到经典搜索，擂台模式则判当前模型技术负。暂停、重开、切换模式或打开配置都会真正取消在途请求，迟到响应不会改变新棋局。
+仓库中的 `llm_config.example.json` 不包含真实密钥，示例中的两份 profile 分别展示 `Cloud` 和 `Local` 配置；只需要一种后端时可以删除另一份。两份 profile 会通过一次原子替换共同保存，旧版单配置会自动迁移为一个 profile，不会擅自复制成第二名选手。配置页面支持 API Key 脱敏显示、显示/隐藏、`Paste` 按钮、`Cmd/Ctrl+V` 粘贴和保存前校验。请求超时、服务报错或模型返回非法坐标时，最多自动尝试 3 次；人机模式随后降级到经典搜索，擂台模式则判当前模型技术负。暂停、重开、切换模式或打开配置都会真正取消在途请求，迟到响应不会改变新棋局。
 
 #### 使用本地 Ollama
 
@@ -96,7 +100,7 @@ ollama pull qwen3:4b
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "profiles": [
     {
       "name": "Qwen Local",
@@ -142,6 +146,7 @@ ollama pull qwen3:4b
 ├── ai.js                   # 网页版 AI 搜索
 ├── wuziqi.html             # 网页版游戏界面与交互
 ├── tests/
+│   ├── llm_config_example.rs # 大模型示例配置契约测试
 │   ├── version_consistency.rs # 公共契约集成测试
 │   └── ai_js.test.js          # 网页 AI 合约测试
 └── run_wuziqi.command      # macOS 一键启动脚本

@@ -14,6 +14,15 @@
 
 - `openrouter.rs` 重构为通用 `cloud.rs`，统一使用标准 OpenAI 兼容请求格式（`max_tokens`，不带 OpenRouter 专属 `reasoning` 字段）
 - 落点解析支持带解释文字、Markdown 代码块、中文标点和多候选讨论等常见模型返回格式
+- 配置 schema 升级到 v3，v2 会自动迁移；v3 Cloud profile 持久化应用维护的 `api_key_origin`
+
+### 修复
+
+- 修正大模型示例配置超过两份 profile 上限的问题，并统一使用 `Cloud` / `Local` 用户可见名称
+- 修复 `no_reasoning` 在配置标准化、保存和重新加载后丢失的问题
+- 修复多候选回复可能采用较早坐标的问题，并在重试时持续排除模型已返回的非法或占用位置
+- Cloud API Key 绑定 API URL 的 origin，修改协议、主机或端口后要求重新输入，避免密钥被发送到其他服务商
+- Dependabot 忽略用于验证最低 Rust 版本的 `dtolnay/rust-toolchain` 固定版本，避免误升级 MSRV 检查
 
 ## [1.0.0] - 2026-07-30
 

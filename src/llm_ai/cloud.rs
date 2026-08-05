@@ -35,7 +35,7 @@ fn build_request<'a>(
         messages,
         max_tokens: 1024,
         temperature: 0.2,
-        thinking: no_reasoning.then(|| ThinkingConfig { r#type: "disabled" }),
+        thinking: no_reasoning.then_some(ThinkingConfig { r#type: "disabled" }),
     }
 }
 
@@ -72,10 +72,7 @@ pub(super) async fn send_request(
         .map_err(|error| format!("Cloud request failed: {error}"))
 }
 
-pub(super) fn resolve_route(
-    value: &Value,
-    configured_model: &str,
-) -> (String, Option<String>) {
+pub(super) fn resolve_route(value: &Value, configured_model: &str) -> (String, Option<String>) {
     let model = value
         .get("model")
         .and_then(Value::as_str)
@@ -119,7 +116,12 @@ mod tests {
 
         assert_eq!(value["thinking"]["type"], "disabled");
         let plain = build_request(DEFAULT_MODEL, &messages, false);
-        assert!(serde_json::to_value(plain).unwrap().get("thinking").is_none());
+        assert!(
+            serde_json::to_value(plain)
+                .unwrap()
+                .get("thinking")
+                .is_none()
+        );
     }
 
     #[test]
@@ -131,10 +133,15 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(validate_url(&reqwest::Url::parse("https://deepseek.com/v1/chat/completions").unwrap()).is_ok());
         assert!(
-            validate_url(&reqwest::Url::parse("http://api.example.com/v1/chat/completions").unwrap())
-                .is_err()
+            validate_url(&reqwest::Url::parse("https://deepseek.com/v1/chat/completions").unwrap())
+                .is_ok()
+        );
+        assert!(
+            validate_url(
+                &reqwest::Url::parse("http://api.example.com/v1/chat/completions").unwrap()
+            )
+            .is_err()
         );
     }
 }

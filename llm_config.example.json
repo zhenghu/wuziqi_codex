@@ -1,17 +1,11 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "profiles": [
     {
-      "name": "GPT-5 mini",
-      "backend": "openrouter",
-      "api_key": "YOUR_OPENROUTER_API_KEY",
-      "api_url": "https://openrouter.ai/api/v1/chat/completions",
-      "model": "openai/gpt-5-mini"
-    },
-    {
-      "name": "DeepSeek",
+      "name": "DeepSeek Cloud",
       "backend": "openrouter",
       "api_key": "YOUR_DEEPSEEK_API_KEY",
+      "api_key_origin": "https://api.deepseek.com",
       "api_url": "https://api.deepseek.com/chat/completions",
       "model": "deepseek-v4-flash",
       "no_reasoning": true
