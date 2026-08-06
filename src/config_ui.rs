@@ -1,7 +1,8 @@
 //! LLM 配置弹窗。配置保存为被 Git 忽略的 JSON 文件。
 
 use crate::llm_ai::{
-    CLOUD_KEY_ORIGIN_CHANGED, LlmBackend, LlmConfig, LlmProfile, LlmSettings, config_path,
+    CLOUD_KEY_ORIGIN_CHANGED, CloudAuth, LlmBackend, LlmConfig, LlmProfile, LlmSettings,
+    config_path,
 };
 use macroquad::miniquad::window::clipboard_get;
 use macroquad::prelude::*;
@@ -11,14 +12,15 @@ use std::process::Command;
 const PANEL_X: f32 = 70.0;
 const PANEL_Y: f32 = 105.0;
 const PANEL_W: f32 = 500.0;
-const PANEL_H: f32 = 490.0;
-const MESSAGE_BASELINE_Y: f32 = 530.0;
-const ACTION_BUTTON_Y: f32 = 545.0;
+const PANEL_H: f32 = 560.0;
+const MESSAGE_BASELINE_Y: f32 = 565.0;
+const ACTION_BUTTON_Y: f32 = 595.0;
 const ACTION_BUTTON_H: f32 = 40.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConfigField {
     ApiKey,
+    ApiKeyHeader,
     Model,
     ApiUrl,
 }
@@ -49,6 +51,8 @@ struct ProfileDraft {
     backend: LlmBackend,
     api_key: String,
     api_key_origin: Option<String>,
+    auth_mode: CloudAuth,
+    api_key_header: String,
     model: String,
     api_url: String,
     no_reasoning: bool,
@@ -61,7 +65,7 @@ struct ProfileDraft {
 impl ProfileDraft {
     fn new(saved: Option<&LlmProfile>, default_name: &str) -> Self {
         let config = saved.map(LlmProfile::config);
-        let backend = config.map_or(LlmBackend::OpenRouter, LlmConfig::backend);
+        let backend = config.map_or(LlmBackend::Cloud, LlmConfig::backend);
         let model = config.map_or_else(
             || backend.default_model().to_string(),
             |config| config.model().to_string(),
@@ -70,12 +74,12 @@ impl ProfileDraft {
             || backend.default_api_url().to_string(),
             |config| config.api_url().to_string(),
         );
-        let mut cloud_model = LlmBackend::OpenRouter.default_model().to_string();
-        let mut cloud_api_url = LlmBackend::OpenRouter.default_api_url().to_string();
+        let mut cloud_model = LlmBackend::Cloud.default_model().to_string();
+        let mut cloud_api_url = LlmBackend::Cloud.default_api_url().to_string();
         let mut local_model = LlmBackend::Local.default_model().to_string();
         let mut local_api_url = LlmBackend::Local.default_api_url().to_string();
         match backend {
-            LlmBackend::OpenRouter => {
+            LlmBackend::Cloud => {
                 cloud_model.clone_from(&model);
                 cloud_api_url.clone_from(&api_url);
             }
@@ -88,11 +92,21 @@ impl ProfileDraft {
         let api_key_origin = config
             .and_then(LlmConfig::api_key_origin)
             .map(str::to_owned);
+        let (auth_mode, api_key_header) = if backend.is_cloud() {
+            (
+                config.map_or(CloudAuth::Bearer, LlmConfig::auth_mode),
+                config.map_or_else(String::new, |config| config.api_key_header().to_string()),
+            )
+        } else {
+            (CloudAuth::Bearer, String::new())
+        };
         Self {
             name: saved.map_or_else(|| default_name.to_string(), |profile| profile.name().into()),
             backend,
             api_key,
             api_key_origin,
+            auth_mode,
+            api_key_header,
             model,
             api_url,
             no_reasoning: config.is_some_and(LlmConfig::no_reasoning_enabled),
@@ -109,7 +123,7 @@ impl ProfileDraft {
         }
 
         match self.backend {
-            LlmBackend::OpenRouter => {
+            LlmBackend::Cloud => {
                 self.cloud_model.clone_from(&self.model);
                 self.cloud_api_url.clone_from(&self.api_url);
             }
@@ -120,7 +134,7 @@ impl ProfileDraft {
         }
         self.backend = backend;
         match backend {
-            LlmBackend::OpenRouter => {
+            LlmBackend::Cloud => {
                 self.model.clone_from(&self.cloud_model);
                 self.api_url.clone_from(&self.cloud_api_url);
             }
@@ -134,13 +148,14 @@ impl ProfileDraft {
     fn active_value_mut(&mut self, field: ConfigField) -> &mut String {
         match field {
             ConfigField::ApiKey => &mut self.api_key,
+            ConfigField::ApiKeyHeader => &mut self.api_key_header,
             ConfigField::Model => &mut self.model,
             ConfigField::ApiUrl => &mut self.api_url,
         }
     }
 
     fn cloud_key_needs_reentry(&self) -> bool {
-        if !self.backend.requires_api_key() || self.api_key.is_empty() {
+        if !self.backend.is_cloud() || !self.auth_mode.requires_key() || self.api_key.is_empty() {
             return false;
         }
         let Some(current_origin) = api_origin(&self.api_url) else {
@@ -159,18 +174,26 @@ impl ProfileDraft {
     }
 
     fn build(&self) -> Result<LlmProfile, String> {
-        if self.backend.requires_api_key() && self.api_key.trim().is_empty() {
-            return Err("Cloud API Key is required".to_string());
-        }
         if self.cloud_key_needs_reentry() {
             return Err(CLOUD_KEY_ORIGIN_CHANGED.to_string());
         }
-        let config = LlmConfig::new(
-            self.backend,
-            self.api_key.clone(),
-            self.api_url.clone(),
-            self.model.clone(),
-        )
+        let config = if self.backend.is_cloud() && self.auth_mode == CloudAuth::Bearer {
+            LlmConfig::new(
+                self.backend,
+                self.api_key.clone(),
+                self.api_url.clone(),
+                self.model.clone(),
+            )
+        } else {
+            LlmConfig::new_with_auth(
+                self.backend,
+                self.api_key.clone(),
+                self.api_url.clone(),
+                self.model.clone(),
+                self.auth_mode,
+                self.api_key_header.clone(),
+            )
+        }
         .map_err(|error| error.to_string())?
         .no_reasoning(self.no_reasoning);
         LlmProfile::new(self.name.clone(), config).map_err(|error| error.to_string())
@@ -213,7 +236,7 @@ impl LlmConfigPage {
         } else {
             ProfileSlot::Black
         };
-        let active = Self::first_field(profiles[active_profile.index()].backend);
+        let active = Self::first_field(&profiles[active_profile.index()]);
         Self {
             profiles,
             active_profile,
@@ -234,7 +257,7 @@ impl LlmConfigPage {
             self.white_enabled = true;
             self.active_profile = ProfileSlot::White;
         }
-        self.active = Self::first_field(self.active_draft().backend);
+        self.active = Self::first_field(self.active_draft());
         self.reveal_key = false;
         self.message = self.load_error.clone().unwrap_or_default();
         if self.message.is_empty() {
@@ -242,16 +265,22 @@ impl LlmConfigPage {
         }
     }
 
-    fn first_field(backend: LlmBackend) -> ConfigField {
-        if backend.requires_api_key() {
-            ConfigField::ApiKey
+    fn first_field(draft: &ProfileDraft) -> ConfigField {
+        if draft.backend.is_cloud() {
+            ConfigField::ApiUrl
         } else {
             ConfigField::Model
         }
     }
 
     fn shows_api_key(&self) -> bool {
-        self.active_draft().backend.requires_api_key()
+        let draft = self.active_draft();
+        draft.backend.is_cloud() && draft.auth_mode.requires_key()
+    }
+
+    fn shows_api_key_header(&self) -> bool {
+        let draft = self.active_draft();
+        draft.backend.is_cloud() && draft.auth_mode == CloudAuth::ApiKeyHeader
     }
 
     fn select_backend(&mut self, backend: LlmBackend) {
@@ -259,8 +288,31 @@ impl LlmConfigPage {
             return;
         }
         self.active_draft_mut().select_backend(backend);
-        self.active = Self::first_field(backend);
+        self.active = Self::first_field(self.active_draft());
         self.reveal_key = false;
+        self.message.clear();
+        self.update_cloud_key_message();
+    }
+
+    fn select_auth_mode(&mut self, auth_mode: CloudAuth) {
+        if !self.active_draft().backend.is_cloud() || self.active_draft().auth_mode == auth_mode {
+            return;
+        }
+        let draft = self.active_draft_mut();
+        draft.auth_mode = auth_mode;
+        if auth_mode == CloudAuth::ApiKeyHeader && draft.api_key_header.is_empty() {
+            draft.api_key_header = "x-api-key".to_string();
+        }
+        if !auth_mode.requires_key() {
+            self.reveal_key = false;
+        }
+        if matches!(self.active, ConfigField::ApiKey | ConfigField::ApiKeyHeader)
+            && (!auth_mode.requires_key()
+                || (self.active == ConfigField::ApiKeyHeader
+                    && auth_mode != CloudAuth::ApiKeyHeader))
+        {
+            self.active = ConfigField::ApiUrl;
+        }
         self.message.clear();
         self.update_cloud_key_message();
     }
@@ -270,7 +322,7 @@ impl LlmConfigPage {
             self.white_enabled = true;
         }
         self.active_profile = profile;
-        self.active = Self::first_field(self.active_draft().backend);
+        self.active = Self::first_field(self.active_draft());
         self.reveal_key = false;
         self.message.clear();
         self.update_cloud_key_message();
@@ -283,7 +335,7 @@ impl LlmConfigPage {
         self.white_enabled = false;
         self.active_profile = ProfileSlot::Black;
         self.human_profile_index = 0;
-        self.active = Self::first_field(self.active_draft().backend);
+        self.active = Self::first_field(self.active_draft());
         self.reveal_key = false;
         self.message = "Second profile will be removed when saved".to_string();
     }
@@ -319,12 +371,23 @@ impl LlmConfigPage {
     }
 
     fn next_field(&mut self) {
-        self.active = match (self.active_draft().backend.requires_api_key(), self.active) {
-            (true, ConfigField::ApiKey) => ConfigField::Model,
-            (true, ConfigField::Model) => ConfigField::ApiUrl,
-            (true, ConfigField::ApiUrl) => ConfigField::ApiKey,
-            (false, ConfigField::ApiKey | ConfigField::ApiUrl) => ConfigField::Model,
-            (false, ConfigField::Model) => ConfigField::ApiUrl,
+        let draft = self.active_draft();
+        let cloud = draft.backend.is_cloud();
+        let auth_mode = draft.auth_mode;
+        self.active = match (cloud, auth_mode, self.active) {
+            (true, _, ConfigField::ApiUrl) => ConfigField::Model,
+            (true, CloudAuth::ApiKeyHeader, ConfigField::Model) => ConfigField::ApiKeyHeader,
+            (true, CloudAuth::Bearer, ConfigField::Model) => ConfigField::ApiKey,
+            (true, CloudAuth::None, ConfigField::Model) => ConfigField::ApiUrl,
+            (true, CloudAuth::ApiKeyHeader, ConfigField::ApiKeyHeader) => ConfigField::ApiKey,
+            (true, _, ConfigField::ApiKey) => ConfigField::ApiUrl,
+            (true, CloudAuth::Bearer | CloudAuth::None, ConfigField::ApiKeyHeader) => {
+                ConfigField::ApiUrl
+            }
+            (false, _, ConfigField::Model) => ConfigField::ApiUrl,
+            (false, _, ConfigField::ApiKey | ConfigField::ApiKeyHeader | ConfigField::ApiUrl) => {
+                ConfigField::Model
+            }
         };
     }
 
@@ -469,10 +532,10 @@ impl LlmConfigPage {
         let active_backend = self.active_draft().backend;
         if draw_choice_button(
             cloud_backend_rect,
-            "Cloud",
-            active_backend == LlmBackend::OpenRouter,
+            "Cloud API",
+            active_backend == LlmBackend::Cloud,
         ) {
-            self.select_backend(LlmBackend::OpenRouter);
+            self.select_backend(LlmBackend::Cloud);
         }
         if draw_choice_button(
             local_backend_rect,
@@ -487,33 +550,63 @@ impl LlmConfigPage {
         {
             self.use_one_profile();
         }
-        let storage_note = config_path().map_or_else(
-            |error| format!("Configuration path unavailable: {error}"),
-            |path| format!("Saved to {}", path.display()),
-        );
-        let storage_note = visible_tail_to_width(&storage_note, 440.0, 15);
-        draw_text(
-            &storage_note,
-            100.0,
-            218.0,
-            15.0,
-            Color::from_rgba(180, 190, 205, 255),
-        );
+        let auth_bearer_rect = Rect::new(155.0, 203.0, 72.0, 32.0);
+        let auth_header_rect = Rect::new(234.0, 203.0, 72.0, 32.0);
+        let auth_none_rect = Rect::new(313.0, 203.0, 60.0, 32.0);
+        let api_key_header_rect = Rect::new(382.0, 203.0, 158.0, 32.0);
+        if self.active_draft().backend.is_cloud() {
+            draw_text(
+                "Auth",
+                100.0,
+                227.0,
+                18.0,
+                Color::from_rgba(220, 225, 235, 255),
+            );
+            let auth_mode = self.active_draft().auth_mode;
+            if draw_choice_button(
+                auth_bearer_rect,
+                CloudAuth::Bearer.label(),
+                auth_mode == CloudAuth::Bearer,
+            ) {
+                self.select_auth_mode(CloudAuth::Bearer);
+            }
+            if draw_choice_button(
+                auth_header_rect,
+                CloudAuth::ApiKeyHeader.label(),
+                auth_mode == CloudAuth::ApiKeyHeader,
+            ) {
+                self.select_auth_mode(CloudAuth::ApiKeyHeader);
+            }
+            if draw_choice_button(
+                auth_none_rect,
+                CloudAuth::None.label(),
+                auth_mode == CloudAuth::None,
+            ) {
+                self.select_auth_mode(CloudAuth::None);
+            }
+            if self.shows_api_key_header() {
+                draw_field(
+                    api_key_header_rect,
+                    &self.active_draft().api_key_header,
+                    self.active == ConfigField::ApiKeyHeader,
+                );
+            }
+        }
 
-        let key_rect = Rect::new(100.0, 255.0, 295.0, 38.0);
-        let paste_rect = Rect::new(405.0, 255.0, 65.0, 38.0);
-        let show_rect = Rect::new(480.0, 255.0, 60.0, 38.0);
-        let model_rect = Rect::new(100.0, 335.0, 440.0, 38.0);
+        let key_rect = Rect::new(100.0, 265.0, 295.0, 38.0);
+        let paste_rect = Rect::new(405.0, 265.0, 65.0, 38.0);
+        let show_rect = Rect::new(480.0, 265.0, 60.0, 38.0);
+        let model_rect = Rect::new(100.0, 340.0, 440.0, 38.0);
         let url_rect = Rect::new(100.0, 415.0, 440.0, 38.0);
         draw_text(
             "Model",
             100.0,
-            327.0,
+            332.0,
             18.0,
             Color::from_rgba(220, 225, 235, 255),
         );
         draw_text(
-            "Chat Completions API URL",
+            "Full Chat Completions API URL",
             100.0,
             407.0,
             18.0,
@@ -522,9 +615,9 @@ impl LlmConfigPage {
 
         if self.shows_api_key() {
             draw_text(
-                "Cloud API Key",
+                "API Key",
                 100.0,
-                247.0,
+                257.0,
                 18.0,
                 Color::from_rgba(220, 225, 235, 255),
             );
@@ -534,19 +627,27 @@ impl LlmConfigPage {
                 masked_api_key(&self.active_draft().api_key)
             };
             draw_field(key_rect, &key_display, self.active == ConfigField::ApiKey);
-        } else {
+        } else if self.active_draft().backend == LlmBackend::Local {
             draw_text(
                 "Local OpenAI-compatible server",
                 100.0,
-                263.0,
+                278.0,
                 18.0,
                 Color::from_rgba(205, 220, 235, 255),
             );
             draw_text(
                 "No key is sent; only 127.0.0.1 or ::1 is allowed.",
                 100.0,
-                288.0,
+                300.0,
                 15.0,
+                Color::from_rgba(155, 190, 170, 255),
+            );
+        } else {
+            draw_text(
+                "No authentication header will be sent.",
+                100.0,
+                285.0,
+                17.0,
                 Color::from_rgba(155, 190, 170, 255),
             );
         }
@@ -561,23 +662,23 @@ impl LlmConfigPage {
             self.active == ConfigField::ApiUrl,
         );
 
-        let no_reasoning_rect = Rect::new(100.0, 464.0, 18.0, 18.0);
-        if self.shows_api_key() {
+        let no_reasoning_rect = Rect::new(100.0, 470.0, 18.0, 18.0);
+        if self.active_draft().backend.is_cloud() {
             let draft = self.active_draft();
             let checked = draft.no_reasoning;
             if checked {
                 draw_rectangle(
                     100.0,
-                    464.0,
+                    470.0,
                     18.0,
                     18.0,
                     Color::from_rgba(120, 200, 160, 255),
                 );
-                draw_text("✓", 103.0, 479.0, 16.0, Color::from_rgba(20, 40, 30, 255));
+                draw_text("✓", 103.0, 485.0, 16.0, Color::from_rgba(20, 40, 30, 255));
             } else {
                 draw_rectangle_lines(
                     100.0,
-                    464.0,
+                    470.0,
                     18.0,
                     18.0,
                     2.0,
@@ -585,9 +686,9 @@ impl LlmConfigPage {
                 );
             }
             draw_text(
-                "No reasoning (DeepSeek reasoning models)",
+                "Disable model reasoning (provider-specific)",
                 128.0,
-                478.0,
+                484.0,
                 15.0,
                 Color::from_rgba(220, 225, 235, 255),
             );
@@ -598,13 +699,19 @@ impl LlmConfigPage {
         if self.shows_api_key() && clicked && key_rect.contains(vec2(mx, my)) {
             self.active = ConfigField::ApiKey;
         }
+        if self.shows_api_key_header() && clicked && api_key_header_rect.contains(vec2(mx, my)) {
+            self.active = ConfigField::ApiKeyHeader;
+        }
         if clicked && model_rect.contains(vec2(mx, my)) {
             self.active = ConfigField::Model;
         }
         if clicked && url_rect.contains(vec2(mx, my)) {
             self.active = ConfigField::ApiUrl;
         }
-        if self.shows_api_key() && clicked && no_reasoning_rect.contains(vec2(mx, my)) {
+        if self.active_draft().backend.is_cloud()
+            && clicked
+            && no_reasoning_rect.contains(vec2(mx, my))
+        {
             self.active_draft_mut().no_reasoning = !self.active_draft().no_reasoning;
         }
         if self.shows_api_key() {
@@ -617,17 +724,29 @@ impl LlmConfigPage {
             }
         }
 
-        let help = if self.shows_api_key() {
-            "Use Paste or Cmd/Ctrl+V. The key is never shown in logs."
+        let help = if self.active_draft().backend.is_cloud() {
+            "Custom HTTPS endpoint; only a non-secret api-version query is allowed."
         } else {
             "Ollama preset; also works with LM Studio and llama.cpp."
         };
         draw_text(
             help,
             100.0,
-            508.0,
+            520.0,
             15.0,
             Color::from_rgba(155, 170, 190, 255),
+        );
+        let storage_note = config_path().map_or_else(
+            |error| format!("Configuration path unavailable: {error}"),
+            |path| format!("Saved to {}", path.display()),
+        );
+        let storage_note = visible_tail_to_width(&storage_note, 440.0, 14);
+        draw_text(
+            &storage_note,
+            100.0,
+            542.0,
+            14.0,
+            Color::from_rgba(180, 190, 205, 255),
         );
         if !self.message.is_empty() {
             let message = visible_head_to_width(&self.message, 440.0, 16);
@@ -966,6 +1085,22 @@ mod tests {
     }
 
     #[test]
+    fn changing_only_a_non_secret_cloud_query_keeps_the_key_usable() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.active = ConfigField::ApiKey;
+        page.apply_pasted_value("cloud-secret");
+        page.active = ConfigField::ApiUrl;
+
+        page.apply_pasted_value(
+            "https://openrouter.ai/api/v1/chat/completions?api-version=2026-01-01",
+        );
+
+        assert!(page.message.is_empty());
+        let settings = page.build_settings().unwrap();
+        assert_eq!(settings.active_profile().config().api_key(), "cloud-secret");
+    }
+
+    #[test]
     fn changing_cloud_scheme_or_port_requires_key_reentry() {
         let mut page = LlmConfigPage::new(None, None);
         page.active = ConfigField::ApiKey;
@@ -984,7 +1119,7 @@ mod tests {
             };
             assert!(error.contains("origin changed"));
 
-            page.apply_pasted_value(LlmBackend::OpenRouter.default_api_url());
+            page.apply_pasted_value(LlmBackend::Cloud.default_api_url());
             assert!(page.message.is_empty());
             assert!(page.build_settings().is_ok());
         }
@@ -1008,7 +1143,7 @@ mod tests {
         assert!(error.contains("re-enter"));
         assert!(!error.contains("openrouter-secret"));
 
-        page.apply_pasted_value(LlmBackend::OpenRouter.default_api_url());
+        page.apply_pasted_value(LlmBackend::Cloud.default_api_url());
         assert!(page.message.is_empty());
         assert_eq!(
             page.build_settings()
@@ -1060,7 +1195,7 @@ mod tests {
 
         page.select_backend(LlmBackend::Local);
         assert!(page.message.is_empty());
-        page.select_backend(LlmBackend::OpenRouter);
+        page.select_backend(LlmBackend::Cloud);
         assert_eq!(page.message, CLOUD_KEY_ORIGIN_CHANGED);
 
         page.select_profile(ProfileSlot::White);
@@ -1093,6 +1228,72 @@ mod tests {
     }
 
     #[test]
+    fn cloud_configuration_starts_with_the_endpoint_and_tabs_through_bearer_fields() {
+        let mut page = LlmConfigPage::new(None, None);
+
+        assert_eq!(page.active, ConfigField::ApiUrl);
+        assert_eq!(page.active_draft().auth_mode, CloudAuth::Bearer);
+        assert!(page.shows_api_key());
+        assert!(!page.shows_api_key_header());
+
+        page.next_field();
+        assert_eq!(page.active, ConfigField::Model);
+        page.next_field();
+        assert_eq!(page.active, ConfigField::ApiKey);
+        page.next_field();
+        assert_eq!(page.active, ConfigField::ApiUrl);
+    }
+
+    #[test]
+    fn custom_header_auth_exposes_and_persists_the_header_name() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.select_auth_mode(CloudAuth::ApiKeyHeader);
+
+        assert!(page.shows_api_key());
+        assert!(page.shows_api_key_header());
+        assert_eq!(page.active_draft().api_key_header, "x-api-key");
+
+        page.next_field();
+        assert_eq!(page.active, ConfigField::Model);
+        page.next_field();
+        assert_eq!(page.active, ConfigField::ApiKeyHeader);
+        page.next_field();
+        assert_eq!(page.active, ConfigField::ApiKey);
+
+        page.active_draft_mut().api_key = "provider-secret".to_string();
+        let origin = api_origin(&page.active_draft().api_url);
+        page.active_draft_mut().api_key_origin = origin;
+        page.active_draft_mut().api_key_header = "api-key".to_string();
+        let settings = page.build_settings().unwrap();
+        let config = settings.active_profile().config();
+
+        assert_eq!(config.auth_mode(), CloudAuth::ApiKeyHeader);
+        assert_eq!(config.api_key_header(), "api-key");
+        assert_eq!(config.api_key(), "provider-secret");
+    }
+
+    #[test]
+    fn no_auth_cloud_configuration_hides_and_drops_the_api_key() {
+        let mut page = LlmConfigPage::new(None, None);
+        page.active_draft_mut().api_key = "unused-secret".to_string();
+
+        page.select_auth_mode(CloudAuth::None);
+
+        assert!(!page.shows_api_key());
+        assert!(!page.shows_api_key_header());
+        page.next_field();
+        assert_eq!(page.active, ConfigField::Model);
+        page.next_field();
+        assert_eq!(page.active, ConfigField::ApiUrl);
+
+        let settings = page.build_settings().unwrap();
+        let config = settings.active_profile().config();
+        assert_eq!(config.auth_mode(), CloudAuth::None);
+        assert!(config.api_key().is_empty());
+        assert_eq!(config.api_key_origin(), None);
+    }
+
+    #[test]
     fn switching_backends_preserves_each_backend_draft() {
         let mut page = LlmConfigPage::new(None, None);
         page.active_draft_mut().model = "custom-router-model".to_string();
@@ -1100,15 +1301,15 @@ mod tests {
         page.active_draft_mut().model = "custom-local".to_string();
         page.active_draft_mut().api_url = "http://127.0.0.1:1234/v1/chat/completions".to_string();
 
-        page.select_backend(LlmBackend::OpenRouter);
+        page.select_backend(LlmBackend::Cloud);
 
-        assert_eq!(page.active_draft().backend, LlmBackend::OpenRouter);
+        assert_eq!(page.active_draft().backend, LlmBackend::Cloud);
         assert_eq!(page.active_draft().model, "custom-router-model");
         assert_eq!(
             page.active_draft().api_url,
-            LlmBackend::OpenRouter.default_api_url()
+            LlmBackend::Cloud.default_api_url()
         );
-        assert_eq!(page.active, ConfigField::ApiKey);
+        assert_eq!(page.active, ConfigField::ApiUrl);
         assert!(page.shows_api_key());
 
         page.select_backend(LlmBackend::Local);
@@ -1131,7 +1332,7 @@ mod tests {
         page.active_draft_mut().model = "white-local".to_string();
 
         page.select_profile(ProfileSlot::Black);
-        assert_eq!(page.active_draft().backend, LlmBackend::OpenRouter);
+        assert_eq!(page.active_draft().backend, LlmBackend::Cloud);
         assert_eq!(page.active_draft().model, "black-router");
         assert_eq!(page.active_draft().api_key, "black-secret");
 
