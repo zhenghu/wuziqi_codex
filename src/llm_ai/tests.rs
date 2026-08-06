@@ -196,7 +196,7 @@ fn run_request_for_side_with_excluded(
     excluded: &[(usize, usize)],
 ) -> Result<LlmMove, String> {
     let client = match config.backend() {
-        LlmBackend::OpenRouter => build_cloud_client(),
+        LlmBackend::Cloud => build_cloud_client(),
         LlmBackend::Local => build_local_client(),
     }
     .unwrap();
@@ -343,7 +343,10 @@ fn extracts_openai_compatible_chat_completion_text() {
         "choices": [{"message": {"role": "assistant", "content": "{\"x\":1,\"y\":2}"}}]
     });
     let array_content: Value = serde_json::json!({
-        "choices": [{"message": {"content": [{"type": "text", "text": "{\"x\":3,\"y\":4}"}]}}]
+        "choices": [{"message": {"content": [
+            {"type": "text", "text": "考虑中心位置"},
+            {"type": "text", "text": "{\"x\":3,\"y\":4}"}
+        ]}}]
     });
     assert_eq!(
         response_text(&string_content).as_deref(),
@@ -351,8 +354,29 @@ fn extracts_openai_compatible_chat_completion_text() {
     );
     assert_eq!(
         response_text(&array_content).as_deref(),
-        Some("{\"x\":3,\"y\":4}")
+        Some("考虑中心位置\n{\"x\":3,\"y\":4}")
     );
+}
+
+#[test]
+fn thinking_responses_use_only_the_final_content_as_the_move() {
+    let response: Value = serde_json::json!({
+        "choices": [{"message": {
+            "reasoning_content": "候选落点可能是 {\"x\":1,\"y\":2}",
+            "content": "{\"x\":7,\"y\":8}"
+        }}]
+    });
+    let reasoning_only: Value = serde_json::json!({
+        "choices": [{"message": {
+            "reasoning_content": "{\"x\":1,\"y\":2}",
+            "content": null
+        }}]
+    });
+
+    let final_content = response_text(&response).unwrap();
+    assert_eq!(final_content, "{\"x\":7,\"y\":8}");
+    assert_eq!(parse_move(&final_content), Some((7, 8)));
+    assert!(response_text(&reasoning_only).is_none());
 }
 
 #[test]
@@ -435,7 +459,7 @@ fn request_rejects_an_empty_side_before_network_io() {
 }
 
 #[test]
-fn legacy_json_configuration_defaults_to_openrouter() {
+fn legacy_json_configuration_defaults_to_cloud_bearer_auth() {
     let raw = r#"{
         "api_key": "sk-or-test",
         "api_url": "https://openrouter.ai/api/v1/chat/completions",
@@ -444,8 +468,9 @@ fn legacy_json_configuration_defaults_to_openrouter() {
     let parsed: LlmConfig = serde_json::from_str(raw).unwrap();
     let config =
         LlmConfig::new(parsed.backend, parsed.api_key, parsed.api_url, parsed.model).unwrap();
-    assert_eq!(config.backend(), LlmBackend::OpenRouter);
+    assert_eq!(config.backend(), LlmBackend::Cloud);
     assert_eq!(config.api_key(), "sk-or-test");
+    assert_eq!(config.auth_mode(), CloudAuth::Bearer);
     assert_eq!(config.api_url(), DEFAULT_CLOUD_API_URL);
     assert_eq!(config.model(), DEFAULT_CLOUD_MODEL);
 }
@@ -455,7 +480,7 @@ fn settings_support_two_named_profiles_and_an_active_profile() {
     let cloud = LlmProfile::new(
         "Cloud",
         LlmConfig::new(
-            LlmBackend::OpenRouter,
+            LlmBackend::Cloud,
             "cloud-key".into(),
             DEFAULT_CLOUD_API_URL.into(),
             "cloud-model".into(),
@@ -534,19 +559,85 @@ fn repairs_only_the_known_cmd_v_paste_artifact() {
 }
 
 #[test]
-fn validates_openrouter_configuration() {
-    assert_eq!(LlmBackend::OpenRouter.label(), "Cloud");
+fn validates_generic_cloud_configuration() {
+    assert_eq!(LlmBackend::Cloud.label(), "Cloud");
     let config = LlmConfig::new(
-        LlmBackend::OpenRouter,
+        LlmBackend::Cloud,
         "key".into(),
         DEFAULT_CLOUD_API_URL.into(),
         "model".into(),
     )
     .unwrap();
     assert_eq!(config.api_key_origin(), Some("https://openrouter.ai"));
+    assert_eq!(config.auth_mode(), CloudAuth::Bearer);
+
+    let header_auth = LlmConfig::new_with_auth(
+        LlmBackend::Cloud,
+        "azure-secret".into(),
+        "https://models.example.com/openai/deployments/demo/chat/completions?api-version=2026-01-01"
+            .into(),
+        "deployment-name".into(),
+        CloudAuth::ApiKeyHeader,
+        "api-key".into(),
+    )
+    .unwrap();
+    assert_eq!(header_auth.auth_mode(), CloudAuth::ApiKeyHeader);
+    assert_eq!(header_auth.api_key_header(), "api-key");
+    assert_eq!(
+        header_auth.api_key_origin(),
+        Some("https://models.example.com")
+    );
+
+    let trailing_query_slash =
+        "https://models.example.com/openai/chat/completions?api-version=preview/";
+    let query_config = LlmConfig::new(
+        LlmBackend::Cloud,
+        "secret".into(),
+        trailing_query_slash.into(),
+        "model".into(),
+    )
+    .unwrap();
+    assert_eq!(query_config.api_url(), trailing_query_slash);
+
+    let no_auth = LlmConfig::new_with_auth(
+        LlmBackend::Cloud,
+        "unused-secret".into(),
+        "https://gateway.example.com/v1/chat/completions".into(),
+        "gateway-model".into(),
+        CloudAuth::None,
+        String::new(),
+    )
+    .unwrap();
+    assert!(no_auth.api_key().is_empty());
+    assert_eq!(no_auth.api_key_origin(), None);
+
+    for (url, header) in [
+        ("https://api.example.com", "x-api-key"),
+        (
+            "https://api.example.com/v1/chat/completions?access_token=secret",
+            "x-api-key",
+        ),
+        (
+            "https://api.example.com/v1/chat/completions",
+            "Content-Type",
+        ),
+    ] {
+        assert!(
+            LlmConfig::new_with_auth(
+                LlmBackend::Cloud,
+                "secret".into(),
+                url.into(),
+                "model".into(),
+                CloudAuth::ApiKeyHeader,
+                header.into(),
+            )
+            .is_err(),
+            "unexpectedly accepted URL {url} with header {header}"
+        );
+    }
     assert_eq!(
         LlmConfig::new(
-            LlmBackend::OpenRouter,
+            LlmBackend::Cloud,
             "".into(),
             DEFAULT_CLOUD_API_URL.into(),
             "model".into()
@@ -554,11 +645,11 @@ fn validates_openrouter_configuration() {
         .err()
         .unwrap()
         .to_string(),
-        "Cloud API Key is required"
+        "Cloud API Key is required for the selected authentication mode"
     );
     assert!(
         LlmConfig::new(
-            LlmBackend::OpenRouter,
+            LlmBackend::Cloud,
             "key".into(),
             "not-a-url".into(),
             "model".into()
@@ -567,7 +658,7 @@ fn validates_openrouter_configuration() {
     );
     assert_eq!(
         LlmConfig::new(
-            LlmBackend::OpenRouter,
+            LlmBackend::Cloud,
             "key".into(),
             "http://openrouter.ai/api/v1/chat/completions".into(),
             "model".into()
@@ -579,7 +670,7 @@ fn validates_openrouter_configuration() {
     );
     assert_eq!(
         LlmConfig::new(
-            LlmBackend::OpenRouter,
+            LlmBackend::Cloud,
             "key".into(),
             "http://example.com/api/v1/chat/completions".into(),
             "model".into()
@@ -591,7 +682,7 @@ fn validates_openrouter_configuration() {
     );
     assert!(
         LlmConfig::new(
-            LlmBackend::OpenRouter,
+            LlmBackend::Cloud,
             "key".into(),
             "http://openrouter.ai/api/v1".into(),
             "model".into()
@@ -600,7 +691,7 @@ fn validates_openrouter_configuration() {
     );
     assert!(
         LlmConfig::new(
-            LlmBackend::OpenRouter,
+            LlmBackend::Cloud,
             "key".into(),
             DEFAULT_CLOUD_API_URL.into(),
             "".into()
@@ -672,7 +763,7 @@ fn migrates_legacy_configuration_to_the_system_path() {
     assert_eq!(loaded.active_profile_index(), 0);
     assert_eq!(loaded.active_profile().name(), "model");
     assert_eq!(config.api_key(), legacy_key.trim_end_matches('v'));
-    assert_eq!(config.backend(), LlmBackend::OpenRouter);
+    assert_eq!(config.backend(), LlmBackend::Cloud);
     assert!(current.exists());
     assert!(!legacy.exists());
     assert!(migrated_legacy_config_path(&legacy).exists());
@@ -692,7 +783,8 @@ fn migrates_legacy_configuration_to_the_system_path() {
         serde_json::from_str(&std::fs::read_to_string(&current).unwrap()).unwrap();
     assert_eq!(migrated_json["schema_version"], SETTINGS_SCHEMA_VERSION);
     assert_eq!(migrated_json["profiles"].as_array().unwrap().len(), 1);
-    assert_eq!(migrated_json["profiles"][0]["backend"], "openrouter");
+    assert_eq!(migrated_json["profiles"][0]["backend"], "cloud");
+    assert_eq!(migrated_json["profiles"][0]["auth_mode"], "bearer");
 }
 
 #[test]
@@ -707,8 +799,13 @@ fn repository_example_loads_through_the_production_normalizer_without_repair() {
     assert_eq!(settings.profiles().len(), MAX_LLM_PROFILES);
     assert_eq!(
         settings.profiles()[0].config().api_key_origin(),
-        Some("https://api.deepseek.com")
+        Some("https://api.example.com")
     );
+    assert_eq!(
+        settings.profiles()[0].config().auth_mode(),
+        CloudAuth::Bearer
+    );
+    assert_eq!(settings.profiles()[1].config().auth_mode(), CloudAuth::None);
     assert_eq!(settings.profiles()[1].config().api_key_origin(), None);
 }
 
@@ -727,13 +824,14 @@ fn upgrades_a_current_three_field_configuration_in_place() {
 
     assert_eq!(
         loaded.active_profile().config().backend(),
-        LlmBackend::OpenRouter
+        LlmBackend::Cloud
     );
     assert_eq!(loaded.profiles().len(), 1);
     let upgraded: Value =
         serde_json::from_str(&std::fs::read_to_string(&current).unwrap()).unwrap();
     assert_eq!(upgraded["schema_version"], SETTINGS_SCHEMA_VERSION);
-    assert_eq!(upgraded["profiles"][0]["backend"], "openrouter");
+    assert_eq!(upgraded["profiles"][0]["backend"], "cloud");
+    assert_eq!(upgraded["profiles"][0]["auth_mode"], "bearer");
     assert_eq!(
         upgraded["profiles"][0]["api_key_origin"],
         "https://openrouter.ai"
@@ -770,6 +868,43 @@ fn rejects_a_persisted_cloud_key_after_its_api_origin_changes() {
 }
 
 #[test]
+fn migrates_a_schema_three_openrouter_profile_to_cloud_bearer_auth() {
+    let root = TestDir::new("schema-three-cloud-migration");
+    let current = root.join(CONFIG_FILE_NAME);
+    let missing_legacy = root.join("missing").join(CONFIG_FILE_NAME);
+    std::fs::write(
+        &current,
+        format!(
+            r#"{{
+                "schema_version": 3,
+                "profiles": [{{
+                    "name": "Existing Cloud",
+                    "backend": "openrouter",
+                    "api_key": "provider-secret",
+                    "api_key_origin": "https://openrouter.ai",
+                    "api_url": "{DEFAULT_CLOUD_API_URL}",
+                    "model": "existing-model"
+                }}],
+                "active_profile": 0
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let loaded = LlmSettings::load_with_paths(&current, &missing_legacy).unwrap();
+    let config = loaded.active_profile().config();
+    assert_eq!(config.backend(), LlmBackend::Cloud);
+    assert_eq!(config.auth_mode(), CloudAuth::Bearer);
+    assert_eq!(config.api_key(), "provider-secret");
+
+    let rewritten: Value =
+        serde_json::from_str(&std::fs::read_to_string(&current).unwrap()).unwrap();
+    assert_eq!(rewritten["schema_version"], SETTINGS_SCHEMA_VERSION);
+    assert_eq!(rewritten["profiles"][0]["backend"], "cloud");
+    assert_eq!(rewritten["profiles"][0]["auth_mode"], "bearer");
+}
+
+#[test]
 fn current_schema_rejects_a_missing_or_null_cloud_key_origin() {
     let root = TestDir::new("missing-cloud-origin");
     for (case, include_null) in [("missing", false), ("null", true)] {
@@ -778,7 +913,8 @@ fn current_schema_rejects_a_missing_or_null_cloud_key_origin() {
             "schema_version": SETTINGS_SCHEMA_VERSION,
             "profiles": [{
                 "name": "Cloud",
-                "backend": "openrouter",
+                "backend": "cloud",
+                "auth_mode": "bearer",
                 "api_key": "provider-secret",
                 "api_url": "https://provider.example/v1/chat/completions",
                 "model": "model"
@@ -810,7 +946,8 @@ fn canonicalizes_an_equivalent_persisted_cloud_origin() {
                 "schema_version": {SETTINGS_SCHEMA_VERSION},
                 "profiles": [{{
                     "name": "Cloud",
-                    "backend": "openrouter",
+                    "backend": "cloud",
+                    "auth_mode": "bearer",
                     "api_key": "provider-secret",
                     "api_key_origin": "https://PROVIDER.example:443/",
                     "api_url": "https://provider.example/v1/chat/completions",
@@ -840,7 +977,7 @@ fn two_profile_settings_round_trip_in_one_versioned_file() {
             LlmProfile::new(
                 "Cloud",
                 LlmConfig::new(
-                    LlmBackend::OpenRouter,
+                    LlmBackend::Cloud,
                     "cloud-key".into(),
                     DEFAULT_CLOUD_API_URL.into(),
                     "cloud-model".into(),
@@ -1054,7 +1191,7 @@ fn atomically_replaces_an_existing_configuration() {
             LlmProfile::new(
                 "Old",
                 LlmConfig::new(
-                    LlmBackend::OpenRouter,
+                    LlmBackend::Cloud,
                     "old-key".into(),
                     DEFAULT_CLOUD_API_URL.into(),
                     "old".into(),
@@ -1072,7 +1209,7 @@ fn atomically_replaces_an_existing_configuration() {
             LlmProfile::new(
                 "New",
                 LlmConfig::new(
-                    LlmBackend::OpenRouter,
+                    LlmBackend::Cloud,
                     "new-key".into(),
                     DEFAULT_CLOUD_API_URL.into(),
                     "new".into(),
@@ -1217,6 +1354,31 @@ fn reports_a_business_error_in_a_successful_response() {
 }
 
 #[test]
+fn successful_response_ignores_a_top_level_status_message() {
+    let server = TestServer::new(
+        "200 OK",
+        r#"{"message":"success","choices":[{"message":{"content":"{\"x\":7,\"y\":7}"}}]}"#,
+    );
+    let config = local_test_config(&server);
+
+    let llm_move = run_request(&config, &[(7, 7)]).unwrap();
+    server.finish();
+
+    assert_eq!(llm_move.position, (7, 7));
+}
+
+#[test]
+fn successful_response_without_choices_reports_its_top_level_message() {
+    let server = TestServer::new("200 OK", r#"{"message":"model is loading"}"#);
+    let config = local_test_config(&server);
+
+    let error = run_request(&config, &[(7, 7)]).unwrap_err();
+    server.finish();
+
+    assert_eq!(error, "Local response has no text: model is loading");
+}
+
+#[test]
 fn rejects_a_move_outside_the_candidate_set() {
     let server = TestServer::new(
         "200 OK",
@@ -1237,7 +1399,7 @@ fn cloud_apis_without_a_routed_model_fall_back_to_the_configured_model() {
         r#"{"choices":[{"message":{"content":"{\"x\":7,\"y\":7}"}}]}"#,
     );
     let config = LlmConfig::new_unchecked(
-        LlmBackend::OpenRouter,
+        LlmBackend::Cloud,
         "openrouter-secret".into(),
         server.url().to_string(),
         "my-model".into(),
@@ -1248,7 +1410,7 @@ fn cloud_apis_without_a_routed_model_fall_back_to_the_configured_model() {
 
     assert_eq!(llm_move.position, (7, 7));
     assert_eq!(llm_move.model, "my-model");
-    assert_eq!(llm_move.provider, None);
+    assert_eq!(llm_move.provider.as_deref(), Some("127.0.0.1"));
 }
 
 #[test]
@@ -1291,7 +1453,7 @@ fn cloud_api_request_uses_standard_openai_compatible_format() {
         }"#,
     );
     let config = LlmConfig::new_unchecked(
-        LlmBackend::OpenRouter,
+        LlmBackend::Cloud,
         "openrouter-secret".into(),
         server.url().to_string(),
         DEFAULT_CLOUD_MODEL.into(),
@@ -1304,15 +1466,61 @@ fn cloud_api_request_uses_standard_openai_compatible_format() {
     assert!(request_lowercase.contains("authorization: bearer openrouter-secret"));
     // 标准 OpenAI 兼容格式：无 OpenRouter 专属 header，无 reasoning 字段
     assert!(!request_lowercase.contains("x-openrouter-title:"));
-    assert!(request.contains("\"max_tokens\":1024"));
+    assert!(!request.contains("\"max_tokens\""));
+    assert!(!request.contains("\"temperature\""));
+    assert!(request.contains("\"stream\":false"));
     assert!(!request.contains("\"reasoning\""));
     assert!(!request.contains("\"max_completion_tokens\""));
 }
 
 #[test]
+fn cloud_api_request_supports_a_custom_api_key_header() {
+    let server = TestServer::new(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"{\"x\":7,\"y\":7}"}}]}"#,
+    );
+    let config = LlmConfig::new_unchecked_with_auth(
+        LlmBackend::Cloud,
+        "custom-secret".into(),
+        server.url().to_string(),
+        "custom-model".into(),
+        CloudAuth::ApiKeyHeader,
+        "x-api-key".into(),
+    );
+
+    run_request(&config, &[(7, 7)]).unwrap();
+    let request = server.finish().to_ascii_lowercase();
+
+    assert!(request.contains("x-api-key: custom-secret"));
+    assert!(!request.contains("authorization:"));
+}
+
+#[test]
+fn cloud_api_request_supports_no_authentication() {
+    let server = TestServer::new(
+        "200 OK",
+        r#"{"choices":[{"message":{"content":"{\"x\":7,\"y\":7}"}}]}"#,
+    );
+    let config = LlmConfig::new_unchecked_with_auth(
+        LlmBackend::Cloud,
+        String::new(),
+        server.url().to_string(),
+        "gateway-model".into(),
+        CloudAuth::None,
+        String::new(),
+    );
+
+    run_request(&config, &[(7, 7)]).unwrap();
+    let request = server.finish().to_ascii_lowercase();
+
+    assert!(!request.contains("authorization:"));
+    assert!(!request.contains("x-api-key:"));
+}
+
+#[test]
 fn cloud_request_refuses_to_send_a_key_after_an_in_memory_origin_change() {
     let mut config = LlmConfig::new(
-        LlmBackend::OpenRouter,
+        LlmBackend::Cloud,
         "provider-a-secret".into(),
         "https://provider-a.example/v1/chat/completions".into(),
         "model".into(),

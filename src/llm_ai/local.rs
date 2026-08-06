@@ -58,6 +58,9 @@ pub(super) fn validate_url(url: &reqwest::Url) -> Result<(), String> {
     if url.path() != "/v1/chat/completions" {
         return Err("Local API URL must use /v1/chat/completions".to_string());
     }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Local API URL must not contain a query or fragment".to_string());
+    }
     Ok(())
 }
 

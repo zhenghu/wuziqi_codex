@@ -1,18 +1,19 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "profiles": [
     {
-      "name": "DeepSeek Cloud",
-      "backend": "openrouter",
-      "api_key": "YOUR_DEEPSEEK_API_KEY",
-      "api_key_origin": "https://api.deepseek.com",
-      "api_url": "https://api.deepseek.com/chat/completions",
-      "model": "deepseek-v4-flash",
-      "no_reasoning": true
+      "name": "Custom Cloud",
+      "backend": "cloud",
+      "auth_mode": "bearer",
+      "api_key": "YOUR_CLOUD_API_KEY",
+      "api_key_origin": "https://api.example.com",
+      "api_url": "https://api.example.com/v1/chat/completions",
+      "model": "YOUR_MODEL_ID"
     },
     {
       "name": "Qwen Local",
       "backend": "local",
+      "auth_mode": "none",
       "api_url": "http://127.0.0.1:11434/v1/chat/completions",
       "model": "qwen3:4b"
     }

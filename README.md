@@ -40,11 +40,13 @@ cargo run --release
 
 ### 大模型 AI（原生版）
 
-大模型模式支持任意 HTTPS 的 OpenAI-compatible 云服务（包括 OpenRouter、DeepSeek、ModelArts 等）和本地服务。点击顶部 `Config (C)` 或按 `C` 打开配置页面；普通模式使用 `Primary` / `Add` 管理配置，擂台设置则以 `Black` / `White` 标识当前棋色。普通人机模式可以只保存一份配置，进入擂台时必须保存两份，配置文件最多保存两份 profile。`Cloud` 后端需要 API Key 且必须使用 HTTPS，`api_url` 需要填完整的端点地址（如 `https://openrouter.ai/api/v1/chat/completions` 或 `https://api.deepseek.com/chat/completions`），应用会按配置原样发送请求。`Local` 后端默认连接 Ollama，也兼容提供 `/v1/chat/completions` 的 LM Studio 和 llama.cpp。
+大模型模式支持通过 HTTPS 调用 OpenAI-compatible Chat Completions 云服务，也支持本地服务。点击顶部 `Config (C)` 或按 `C` 打开配置页面；普通模式使用 `Primary` / `Add` 管理配置，擂台设置则以 `Black` / `White` 标识当前棋色。普通人机模式可以只保存一份配置，进入擂台时必须保存两份，配置文件最多保存两份 profile。`Cloud` 的兼容范围以 Chat Completions 请求与响应格式为准；`api_url` 必须填写包含路径的完整 HTTPS 端点（例如 `https://openrouter.ai/api/v1/chat/completions`），应用不会把基础 URL 自动补成 `/chat/completions`。`Local` 后端默认连接 Ollama，也兼容提供 `/v1/chat/completions` 的 LM Studio 和 llama.cpp。
 
-配置文件中 `Cloud` 后端继续使用 `"backend": "openrouter"` 作为向后兼容的 JSON 标识；它并不限定服务商为 OpenRouter。建议在配置页面切换供应商并重新输入该服务商的 API Key、完整 HTTPS 端点和模型 ID。为避免把密钥发送给另一个服务商，Cloud API Key 会绑定到 API URL 的 origin（协议、主机和端口），仅修改同一 origin 下的路径不需要重输。v2 配置会自动迁移到 v3；v3 的 Cloud profile 必须保留应用维护的 `api_key_origin`。若手工创建 JSON，该字段必须与 `api_url` 的 origin 一致；现有配置的绑定不匹配时应用会拒绝加载，请恢复原配置或重新创建该 profile，不要把旧绑定复制到新服务商配置。
+Cloud profile 通过 `auth_mode` 选择认证方式：`bearer` 发送 `Authorization: Bearer <API Key>`；`api_key_header` 把 Key 放入 `api_key_header` 指定的 Header（例如 `x-api-key`）；`none` 不发送认证信息。`api_key_header` 只能用于 `api_key_header` 模式，其他模式应省略该字段；`bearer` 和 `api_key_header` 必须提供 `api_key`，`none` 则不应保存 Key。完整端点只允许非秘密的 `api-version` query 参数；其他 query 参数和 URL fragment 会被拒绝，认证信息必须使用上述认证模式配置。
 
-推理模型（如 DeepSeek 的 reasoning 系列、`deepseek-v4-flash`）在复杂局面会把大量 token 消耗在思考过程，导致最终答案为空而报"无法解析落点"。使用示例中的 `deepseek-v4-flash` 时应保留 `"no_reasoning": true`，应用会发送 `thinking: {"type":"disabled"}` 关闭推理。该字段为可选，未配置时保持标准 OpenAI 兼容请求，不发送任何推理相关参数。
+配置 schema 当前为 v4，新配置使用 `"backend": "cloud"`。旧值 `"openrouter"` 仅作为迁移兼容别名，加载后会改写为 `"cloud"`；v2/v3 配置也会自动迁移到 v4。为避免把密钥发送给另一个服务商，使用 `bearer` 或 `api_key_header` 时，API Key 会绑定到 API URL 的 origin（协议、主机和端口），仅修改同一 origin 下的路径或非秘密 query 不需要重输。手工创建 JSON 时，`api_key_origin` 必须与 `api_url` 的 origin 一致；现有配置的绑定不匹配时应用会拒绝加载，请恢复原配置或重新创建该 profile，不要把旧绑定复制到新服务商配置。`none` 模式不保存 `api_key_origin`。
+
+`no_reasoning` 是供应商专用的显式 opt-in，而不是通用 OpenAI-compatible 开关。设置 `"no_reasoning": true` 后，华为 MaaS OpenAI-compatible 端点会发送 `chat_template_kwargs: {"thinking": false}`；其他端点仍使用 `thinking: {"type":"disabled"}`。只有服务商文档明确支持对应字段时才应启用，通用 Cloud 配置应省略该字段，以免兼容服务拒绝未知参数。
 
 为避免云端密钥泄露，`Local` 后端只接受 `http` 或 `https` 的数字回环地址（`127.0.0.1` 或 `::1`，不接受 `localhost`），并且请求本地服务时不会发送云端 API Key。配置保存在系统用户配置目录，并在 macOS/Linux 上设置为仅当前用户可读写。
 
@@ -58,20 +60,21 @@ cargo run --release
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "profiles": [
     {
-      "name": "DeepSeek Cloud",
-      "backend": "openrouter",
-      "api_key": "YOUR_DEEPSEEK_API_KEY",
-      "api_key_origin": "https://api.deepseek.com",
-      "api_url": "https://api.deepseek.com/chat/completions",
-      "model": "deepseek-v4-flash",
-      "no_reasoning": true
+      "name": "Custom Cloud",
+      "backend": "cloud",
+      "auth_mode": "bearer",
+      "api_key": "YOUR_CLOUD_API_KEY",
+      "api_key_origin": "https://api.example.com",
+      "api_url": "https://api.example.com/v1/chat/completions",
+      "model": "YOUR_MODEL_ID"
     },
     {
       "name": "Qwen Local",
       "backend": "local",
+      "auth_mode": "none",
       "api_url": "http://127.0.0.1:11434/v1/chat/completions",
       "model": "qwen3:4b"
     }
@@ -80,7 +83,7 @@ cargo run --release
 }
 ```
 
-仓库中的 `llm_config.example.json` 不包含真实密钥，示例中的两份 profile 分别展示 `Cloud` 和 `Local` 配置；只需要一种后端时可以删除另一份。两份 profile 会通过一次原子替换共同保存，旧版单配置会自动迁移为一个 profile，不会擅自复制成第二名选手。配置页面支持 API Key 脱敏显示、显示/隐藏、`Paste` 按钮、`Cmd/Ctrl+V` 粘贴和保存前校验。请求超时、服务报错或模型返回非法坐标时，最多自动尝试 3 次；人机模式随后降级到经典搜索，擂台模式则判当前模型技术负。暂停、重开、切换模式或打开配置都会真正取消在途请求，迟到响应不会改变新棋局。
+仓库中的 `llm_config.example.json` 不包含真实密钥；其中 `api.example.com`、`YOUR_CLOUD_API_KEY` 和 `YOUR_MODEL_ID` 都是需要替换的占位符。示例中的两份 profile 分别展示 `Cloud` 和 `Local` 配置；只需要一种后端时可以删除另一份。两份 profile 会通过一次原子替换共同保存，旧版单配置会自动迁移为一个 profile，不会擅自复制成第二名选手。配置页面支持 API Key 脱敏显示、显示/隐藏、`Paste` 按钮、`Cmd/Ctrl+V` 粘贴和保存前校验。请求超时、服务报错或模型返回非法坐标时，最多自动尝试 3 次；人机模式随后降级到经典搜索，擂台模式则判当前模型技术负。暂停、重开、切换模式或打开配置都会真正取消在途请求，迟到响应不会改变新棋局。
 
 #### 使用本地 Ollama
 
@@ -100,11 +103,12 @@ ollama pull qwen3:4b
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "profiles": [
     {
       "name": "Qwen Local",
       "backend": "local",
+      "auth_mode": "none",
       "api_url": "http://127.0.0.1:11434/v1/chat/completions",
       "model": "qwen3:4b"
     }
@@ -113,7 +117,7 @@ ollama pull qwen3:4b
 }
 ```
 
-使用 LM Studio 或 llama.cpp 时，先启动其 OpenAI-compatible 本地服务器，再把 `api_url` 改为对应数字回环地址，并将 `model` 改为服务暴露的模型 ID。本地配置不需要 `api_key`，应用不会把云端 Key 附加到本地请求。
+使用 LM Studio 或 llama.cpp 时，先启动其 OpenAI-compatible 本地服务器，再把 `api_url` 改为对应数字回环地址，并将 `model` 改为服务暴露的模型 ID。本地配置固定使用无认证请求，不需要 `api_key` 或 `api_key_header`，应用不会把云端 Key 附加到本地请求。
 
 没装 Rust 的话,macOS 下直接双击 `run_wuziqi.command`,脚本会自动通过 [rustup](https://rustup.rs) 安装工具链并编译运行。
 
@@ -140,7 +144,7 @@ ollama pull qwen3:4b
 │   ├── llm_ai.rs           # 大模型共享配置、提示词与结果校验
 │   ├── test_support.rs      # Rust 测试共享构造器
 │   └── llm_ai/
-│       ├── cloud.rs        # 云端 OpenAI 兼容请求与响应适配（任意 HTTPS API）
+│       ├── cloud.rs        # 云端 HTTPS Chat Completions 请求与响应适配
 │       └── local.rs        # 本地兼容请求与安全校验
 ├── llm_config.example.json # 大模型配置示例（不含真实 Key）
 ├── ai.js                   # 网页版 AI 搜索

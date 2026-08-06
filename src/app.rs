@@ -56,7 +56,7 @@ enum ArenaState {
 
 enum LlmCommand {
     Request {
-        config: LlmConfig,
+        config: Box<LlmConfig>,
         side: Cell,
         board: Box<[[Cell; crate::game::BOARD]; crate::game::BOARD]>,
         candidates: Vec<(usize, usize)>,
@@ -115,7 +115,7 @@ impl LlmWorker {
                                 result,
                             } => {
                                 let client = match config.backend() {
-                                    LlmBackend::OpenRouter => cloud_client.clone(),
+                                    LlmBackend::Cloud => cloud_client.clone(),
                                     LlmBackend::Local => local_client.clone(),
                                 };
                                 active = Some(tokio::spawn(async move {
@@ -154,7 +154,7 @@ impl LlmWorker {
         let (result, receiver) = mpsc::channel();
         self.commands
             .send(LlmCommand::Request {
-                config,
+                config: Box::new(config),
                 side,
                 board: Box::new(board),
                 candidates,

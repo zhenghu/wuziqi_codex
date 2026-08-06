@@ -96,7 +96,7 @@ fn single_settings() -> LlmSettings {
 
 fn arena_settings() -> LlmSettings {
     let black = LlmConfig::new_unchecked(
-        LlmBackend::OpenRouter,
+        LlmBackend::Cloud,
         "black-secret".to_string(),
         crate::llm_ai::DEFAULT_CLOUD_API_URL.to_string(),
         "black-model".to_string(),
@@ -330,7 +330,7 @@ fn arena_alternates_black_and_white_with_isolated_profiles() {
         let requests = state.requests.borrow();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].side, Cell::Black);
-        assert_eq!(requests[0].backend, LlmBackend::OpenRouter);
+        assert_eq!(requests[0].backend, LlmBackend::Cloud);
         assert_eq!(requests[0].api_key, "black-secret");
         assert_eq!(requests[0].model, "black-model");
         assert_eq!(requests[0].candidates, vec![(7, 7)]);

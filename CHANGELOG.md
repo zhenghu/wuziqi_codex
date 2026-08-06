@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### 新增
+
+- Cloud profile 新增 `bearer`、`api_key_header` 和 `none` 三种认证模式；自定义 Key Header 仅在 `api_key_header` 模式发送，本地后端始终不发送认证信息
+
+### 改进
+
+- 配置 schema 升级到 v4，新 Cloud profile 使用 `"backend": "cloud"`，并保留旧 `"openrouter"` 值的自动迁移兼容
+- Cloud 配置要求填写完整 HTTPS Chat Completions 端点，只允许非秘密的 `api-version` query 参数，防止凭据通过 URL 保存、显示或泄漏
+- 将 `no_reasoning` 明确为供应商专用的显式 opt-in；通用 Cloud 示例改用不含真实服务商或推理参数的占位配置
+- 适配华为 MaaS OpenAI-compatible 推理开关；关闭 openPangu 等模型的深度思考时发送 `chat_template_kwargs.thinking=false`，MaaS V2 等端点继续使用 `thinking.type=disabled`
+- Cloud 连接超时设为 10 秒、总请求超时由 30 秒延长到 60 秒，并显式发送 `stream=false`，兼顾推理模型响应时间与现有整包 JSON 解析
+
 ## [1.0.0] - 2026-08-06
 
 ### 新增

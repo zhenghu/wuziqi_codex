@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 const CONFIG_FILE_NAME: &str = "llm_config.json";
 const LEGACY_SETTINGS_SCHEMA_VERSION: u32 = 2;
-const SETTINGS_SCHEMA_VERSION: u32 = 3;
+const SETTINGS_SCHEMA_VERSION: u32 = 4;
 const MAX_LLM_PROFILES: usize = 2;
 pub(crate) const DEFAULT_CLOUD_API_URL: &str = cloud::DEFAULT_API_URL;
 pub(crate) const DEFAULT_CLOUD_MODEL: &str = cloud::DEFAULT_MODEL;
@@ -189,8 +189,8 @@ pub(crate) fn config_exists() -> bool {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum LlmBackend {
     #[default]
-    #[serde(rename = "openrouter")]
-    OpenRouter,
+    #[serde(rename = "cloud", alias = "openrouter")]
+    Cloud,
     #[serde(rename = "local")]
     Local,
 }
@@ -198,27 +198,53 @@ pub(crate) enum LlmBackend {
 impl LlmBackend {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::OpenRouter => "Cloud",
+            Self::Cloud => "Cloud",
             Self::Local => "Local",
         }
     }
 
     pub(crate) fn default_api_url(self) -> &'static str {
         match self {
-            Self::OpenRouter => DEFAULT_CLOUD_API_URL,
+            Self::Cloud => DEFAULT_CLOUD_API_URL,
             Self::Local => DEFAULT_LOCAL_API_URL,
         }
     }
 
     pub(crate) fn default_model(self) -> &'static str {
         match self {
-            Self::OpenRouter => DEFAULT_CLOUD_MODEL,
+            Self::Cloud => DEFAULT_CLOUD_MODEL,
             Self::Local => DEFAULT_LOCAL_MODEL,
         }
     }
 
-    pub(crate) fn requires_api_key(self) -> bool {
-        matches!(self, Self::OpenRouter)
+    pub(crate) fn is_cloud(self) -> bool {
+        matches!(self, Self::Cloud)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CloudAuth {
+    /// `Authorization: Bearer <API key>`，适用于大多数 OpenAI-compatible 服务。
+    #[default]
+    Bearer,
+    /// 将 API key 原样放入用户指定的 Header，例如 `api-key` 或 `x-api-key`。
+    ApiKeyHeader,
+    /// 不发送认证信息，适用于无需鉴权的受信任网关。
+    None,
+}
+
+impl CloudAuth {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Bearer => "Bearer",
+            Self::ApiKeyHeader => "Header",
+            Self::None => "None",
+        }
+    }
+
+    pub(crate) fn requires_key(self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -230,10 +256,14 @@ pub(crate) struct LlmConfig {
     api_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     api_key_origin: Option<String>,
+    #[serde(default)]
+    auth_mode: CloudAuth,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    api_key_header: String,
     api_url: String,
     model: String,
-    /// 推理模型（如 DeepSeek 的 reasoning 系列）在复杂局面会消耗大量 token
-    /// 思考，导致最终答案为空。开启后在请求中发送 `thinking: {"type":"disabled"}`。
+    /// 推理模型在复杂局面会消耗大量 token 思考，导致最终答案为空。
+    /// 开启后按照已知服务端协议发送关闭思考参数。
     #[serde(default, skip_serializing_if = "is_false")]
     no_reasoning: bool,
 }
@@ -293,14 +323,28 @@ impl LlmConfig {
         api_url: String,
         model: String,
     ) -> ConfigResult<Self> {
+        let auth_mode = if backend.is_cloud() {
+            CloudAuth::Bearer
+        } else {
+            CloudAuth::None
+        };
+        Self::new_with_auth(backend, api_key, api_url, model, auth_mode, String::new())
+    }
+
+    pub(crate) fn new_with_auth(
+        backend: LlmBackend,
+        api_key: String,
+        api_url: String,
+        model: String,
+        auth_mode: CloudAuth,
+        api_key_header: String,
+    ) -> ConfigResult<Self> {
         let mut api_key = api_key.trim().to_string();
-        let api_url = api_url.trim().trim_end_matches('/').to_string();
+        let mut api_key_header = api_key_header.trim().to_string();
+        // The URL is opaque user configuration. In particular, trimming its final `/`
+        // could corrupt a query value such as `?api-version=preview/`.
+        let api_url = api_url.trim().to_string();
         let model = model.trim().to_string();
-        if backend.requires_api_key() && api_key.is_empty() {
-            return Err(ConfigError::Invalid(
-                "Cloud API Key is required".to_string(),
-            ));
-        }
         if model.is_empty() {
             return Err(ConfigError::Invalid("Model name is required".to_string()));
         }
@@ -311,29 +355,45 @@ impl LlmConfig {
                 "API URL must not contain credentials".to_string(),
             ));
         }
-        if parsed.query().is_some() || parsed.fragment().is_some() {
+        if parsed.fragment().is_some() {
             return Err(ConfigError::Invalid(
-                "API URL must not contain a query or fragment".to_string(),
+                "API URL must not contain a fragment".to_string(),
             ));
         }
 
-        let api_key_origin = match backend {
-            LlmBackend::OpenRouter => {
+        let (auth_mode, api_key_origin) = match backend {
+            LlmBackend::Cloud => {
                 cloud::validate_url(&parsed).map_err(ConfigError::Invalid)?;
-                Some(parsed.origin().ascii_serialization())
+                cloud::validate_auth(auth_mode, &api_key_header, &api_key)
+                    .map_err(ConfigError::Invalid)?;
+                if auth_mode != CloudAuth::ApiKeyHeader {
+                    api_key_header.clear();
+                }
+                if !auth_mode.requires_key() {
+                    api_key.clear();
+                }
+                (
+                    auth_mode,
+                    auth_mode
+                        .requires_key()
+                        .then(|| parsed.origin().ascii_serialization()),
+                )
             }
             LlmBackend::Local => {
                 local::validate_url(&parsed).map_err(ConfigError::Invalid)?;
                 // A cloud credential must never be retained or sent while the
                 // local transport is selected.
                 api_key.clear();
-                None
+                api_key_header.clear();
+                (CloudAuth::None, None)
             }
         };
         Ok(Self {
             backend,
             api_key,
             api_key_origin,
+            auth_mode,
+            api_key_header,
             api_url,
             model,
             no_reasoning: false,
@@ -347,7 +407,24 @@ impl LlmConfig {
         api_url: String,
         model: String,
     ) -> Self {
-        let api_key_origin = backend.requires_api_key().then(|| {
+        let auth_mode = if backend.is_cloud() {
+            CloudAuth::Bearer
+        } else {
+            CloudAuth::None
+        };
+        Self::new_unchecked_with_auth(backend, api_key, api_url, model, auth_mode, String::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unchecked_with_auth(
+        backend: LlmBackend,
+        api_key: String,
+        api_url: String,
+        model: String,
+        auth_mode: CloudAuth,
+        api_key_header: String,
+    ) -> Self {
+        let api_key_origin = (backend.is_cloud() && auth_mode.requires_key()).then(|| {
             reqwest::Url::parse(&api_url)
                 .ok()
                 .map(|url| url.origin().ascii_serialization())
@@ -356,13 +433,15 @@ impl LlmConfig {
             backend,
             api_key,
             api_key_origin: api_key_origin.flatten(),
+            auth_mode,
+            api_key_header,
             api_url,
             model,
             no_reasoning: false,
         }
     }
 
-    /// 关闭推理模型的思考过程（发送 `thinking: {"type":"disabled"}`）。
+    /// 关闭推理模型的思考过程；具体请求字段由云端协议适配器选择。
     pub(crate) fn no_reasoning(mut self, enabled: bool) -> Self {
         self.no_reasoning = enabled;
         self
@@ -380,6 +459,14 @@ impl LlmConfig {
         self.api_key_origin.as_deref()
     }
 
+    pub(crate) fn auth_mode(&self) -> CloudAuth {
+        self.auth_mode
+    }
+
+    pub(crate) fn api_key_header(&self) -> &str {
+        &self.api_key_header
+    }
+
     pub(crate) fn backend(&self) -> LlmBackend {
         self.backend
     }
@@ -392,8 +479,12 @@ impl LlmConfig {
         &self.model
     }
 
+    fn sends_api_key(&self) -> bool {
+        self.backend.is_cloud() && self.auth_mode.requires_key()
+    }
+
     fn validate_cloud_key_origin(&self) -> Result<(), String> {
-        if !self.backend.requires_api_key() {
+        if !self.sends_api_key() {
             return Ok(());
         }
         let parsed = reqwest::Url::parse(&self.api_url)
@@ -583,6 +674,15 @@ impl LlmSettings {
                         .iter()
                         .any(|profile| profile.get("backend").is_none())
                 });
+        let backend_used_legacy_name =
+            value
+                .get("profiles")
+                .and_then(Value::as_array)
+                .is_some_and(|profiles| {
+                    profiles.iter().any(|profile| {
+                        profile.get("backend").and_then(Value::as_str) == Some("openrouter")
+                    })
+                });
         let active_profile_was_missing = value.get("active_profile").is_none();
         let raw: Self = serde_json::from_value(value).map_err(|source| ConfigError::Json {
             path: path.to_path_buf(),
@@ -605,6 +705,7 @@ impl LlmSettings {
         )?;
         let changed = version != u64::from(SETTINGS_SCHEMA_VERSION)
             || backend_was_missing
+            || backend_used_legacy_name
             || active_profile_was_missing
             || settings
                 .profiles
@@ -615,6 +716,8 @@ impl LlmSettings {
                         || profile.config.backend != raw_config.backend
                         || profile.config.api_key != raw_config.api_key
                         || profile.config.api_key_origin != raw_config.api_key_origin
+                        || profile.config.auth_mode != raw_config.auth_mode
+                        || profile.config.api_key_header != raw_config.api_key_header
                         || profile.config.api_url != raw_config.api_url
                         || profile.config.model != raw_config.model
                         || profile.config.no_reasoning != raw_config.no_reasoning
@@ -643,7 +746,8 @@ impl LlmSettings {
 
 fn normalize_config(raw: LlmConfig, allow_missing_cloud_origin: bool) -> ConfigResult<LlmConfig> {
     let repaired_key = repair_paste_artifact(&raw.api_key);
-    let bound_origin = if raw.backend.requires_api_key() {
+    let sends_api_key = raw.sends_api_key();
+    let bound_origin = if sends_api_key {
         raw.api_key_origin
             .as_deref()
             .map(canonical_api_origin)
@@ -651,8 +755,15 @@ fn normalize_config(raw: LlmConfig, allow_missing_cloud_origin: bool) -> ConfigR
     } else {
         None
     };
-    let config = LlmConfig::new(raw.backend, repaired_key, raw.api_url, raw.model)?;
-    if config.backend.requires_api_key() {
+    let config = LlmConfig::new_with_auth(
+        raw.backend,
+        repaired_key,
+        raw.api_url,
+        raw.model,
+        raw.auth_mode,
+        raw.api_key_header,
+    )?;
+    if config.sends_api_key() {
         if let Some(bound_origin) = bound_origin {
             if config.api_key_origin.as_deref() != Some(bound_origin.as_str()) {
                 return Err(ConfigError::Invalid(CLOUD_KEY_ORIGIN_CHANGED.to_string()));
@@ -769,11 +880,12 @@ fn response_text(value: &Value) -> Option<String> {
     if let Some(text) = content.as_str() {
         return Some(text.to_string());
     }
-    content.as_array()?.iter().find_map(|part| {
-        part.get("text")?
-            .as_str()
-            .map(std::string::ToString::to_string)
-    })
+    let parts = content
+        .as_array()?
+        .iter()
+        .filter_map(|part| part.get("text")?.as_str())
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
 fn api_error_message(value: &Value) -> Option<&str> {
@@ -781,7 +893,10 @@ fn api_error_message(value: &Value) -> Option<&str> {
         .pointer("/error/message")
         .and_then(Value::as_str)
         .or_else(|| value.get("error").and_then(Value::as_str))
-        .or_else(|| value.get("message").and_then(Value::as_str))
+}
+
+fn http_error_message(value: &Value) -> Option<&str> {
+    api_error_message(value).or_else(|| value.get("message").and_then(Value::as_str))
 }
 
 fn error_detail(text: &str) -> String {
@@ -1169,17 +1284,9 @@ pub(crate) async fn request_move(
         },
     ];
     let response = match config.backend {
-        LlmBackend::OpenRouter => {
+        LlmBackend::Cloud => {
             config.validate_cloud_key_origin()?;
-            cloud::send_request(
-                client,
-                &config.api_url,
-                &config.api_key,
-                &config.model,
-                config.no_reasoning,
-                &messages,
-            )
-            .await?
+            cloud::send_request(client, config, &messages).await?
         }
         LlmBackend::Local => {
             local::send_request(client, &config.api_url, &config.model, &messages).await?
@@ -1192,7 +1299,7 @@ pub(crate) async fn request_move(
         let detail = parsed
             .as_ref()
             .ok()
-            .and_then(api_error_message)
+            .and_then(http_error_message)
             .unwrap_or(&body);
         return Err(format!(
             "{} HTTP {}: {}",
@@ -1211,6 +1318,17 @@ pub(crate) async fn request_move(
         ));
     }
     let text = response_text(&value).ok_or_else(|| {
+        if let Some(message) = value
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+        {
+            return format!(
+                "{} response has no text: {}",
+                config.backend.label(),
+                error_detail(message)
+            );
+        }
         let finish_reason = value
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
@@ -1234,7 +1352,7 @@ pub(crate) async fn request_move(
         return Err(format!("模型返回了候选集外的落点: {chosen:?}"));
     }
     let (model, provider) = match config.backend {
-        LlmBackend::OpenRouter => cloud::resolve_route(&value, &config.model),
+        LlmBackend::Cloud => cloud::resolve_route(&value, &config.model, &config.api_url),
         LlmBackend::Local => local::resolve_route(&value, &config.model),
     };
     Ok(LlmMove {
