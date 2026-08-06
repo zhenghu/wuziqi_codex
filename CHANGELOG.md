@@ -4,17 +4,26 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-06
+
 ### 新增
 
 - 云端大模型支持任意 HTTPS OpenAI 兼容服务（DeepSeek、ModelArts 等），不再局限于 OpenRouter 域名
 - 新增 `no_reasoning` 配置项，对推理模型发送 `thinking: {"type":"disabled"}`，避免复杂局面下推理耗尽 token 导致答案为空；配置页面提供对应勾选框
 - 大模型落点失败重试时排除模型选错的位置并在提示词中告知模型避开，提升不稳定模型的成功率
+- OpenRouter 请求失败后显示失败原因，最多自动尝试 3 次，再降级到战术搜索
+- 支持 Ollama、LM Studio 和 llama.cpp 等本地 OpenAI-compatible 大模型服务
+- 新增双模型擂台模式，支持黑白独立配置、自动轮流落子、暂停、重开和交换颜色
+- 擂台分别展示双方实际模型路由，请求重试耗尽后按技术负结束且不使用战术 AI 代走
 
 ### 改进
 
 - `openrouter.rs` 重构为通用 `cloud.rs`，统一使用标准 OpenAI 兼容请求格式（`max_tokens`，不带 OpenRouter 专属 `reasoning` 字段）
 - 落点解析支持带解释文字、Markdown 代码块、中文标点和多候选讨论等常见模型返回格式
 - 配置 schema 升级到 v3，v2 会自动迁移；v3 Cloud profile 持久化应用维护的 `api_key_origin`
+- 本地后端只允许数字回环地址，且不会保存或发送 OpenRouter API Key
+- 大模型配置升级为带版本的双 profile 格式，保留旧单配置自动迁移并继续采用原子写入
+- 大模型请求显式携带当前棋色，并通过对局、请求和手数快照丢弃迟到响应
 
 ### 修复
 
@@ -23,21 +32,6 @@
 - 修复多候选回复可能采用较早坐标的问题，并在重试时持续排除模型已返回的非法或占用位置
 - Cloud API Key 绑定 API URL 的 origin，修改协议、主机或端口后要求重新输入，避免密钥被发送到其他服务商
 - Dependabot 忽略用于验证最低 Rust 版本的 `dtolnay/rust-toolchain` 固定版本，避免误升级 MSRV 检查
-
-## [1.0.0] - 2026-07-30
-
-### 新增
-
-- OpenRouter 请求失败后显示失败原因，最多自动尝试 3 次，再降级到战术搜索
-- 支持 Ollama、LM Studio 和 llama.cpp 等本地 OpenAI-compatible 大模型服务
-- 新增双模型擂台模式，支持黑白独立配置、自动轮流落子、暂停、重开和交换颜色
-- 擂台分别展示双方实际模型路由，请求重试耗尽后按技术负结束且不使用战术 AI 代走
-
-### 改进
-
-- 本地后端只允许数字回环地址，且不会保存或发送 OpenRouter API Key
-- 大模型配置升级为带版本的双 profile 格式，保留旧单配置自动迁移并继续采用原子写入
-- 大模型请求显式携带当前棋色，并通过对局、请求和手数快照丢弃迟到响应
 
 ## [0.2.0-beta.1] - 2026-07-27
 
